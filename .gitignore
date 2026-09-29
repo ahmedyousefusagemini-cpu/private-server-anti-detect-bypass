@@ -96,8 +96,7 @@ _ReSharper*/
 *.a
 *.lib
 
-# Except the prebuilt MinHook static lib (needed to build the project)
-!libMinHook.x86.lib
+# MinHook is built from libs/minhook/src (plain .c/.h, not ignored)
 
 # Executables
 *.exe

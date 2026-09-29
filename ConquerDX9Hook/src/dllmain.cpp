@@ -7,7 +7,9 @@
 #include "MinHook.h"
 
 #pragma comment(lib, "d3d9.lib")
-#pragma comment(lib, "libMinHook.x86.lib")
+// MinHook is compiled from libs\minhook\src (see the .vcxproj) so it is built
+// with the same toolset as this project - the old prebuilt libMinHook.x86.lib
+// triggered C1047 (compiler version mismatch).
 
 extern GameWindowInfo g_gameWindow;
 extern EndSceneFunc g_originalEndSceneFunction;
