@@ -181,13 +181,33 @@ bool IsBlockedWindow(HWND hwnd)
 // ---------------------------------------------------------------------------
 // Original function pointers
 // ---------------------------------------------------------------------------
+// tlhelp32.h names the ANSI structure PROCESSENTRY32 and, under UNICODE,
+// #defines PROCESSENTRY32 -> PROCESSENTRY32W. There is no PROCESSENTRY32A /
+// LPPROCESSENTRY32A, so declare the ANSI layout here. It is identical to the
+// wide one except szExeFile is CHAR, and szExeFile sits at offset 0x24 in both
+// on x86.
+struct ProcessEntry32A
+{
+	DWORD     dwSize;
+	DWORD     cntUsage;
+	DWORD     th32ProcessID;
+	ULONG_PTR th32DefaultHeapID;
+	DWORD     th32ModuleID;
+	DWORD     cntThreads;
+	DWORD     th32ParentProcessID;
+	LONG      pcPriClassBase;
+	DWORD     dwFlags;
+	CHAR      szExeFile[MAX_PATH];
+};
+typedef ProcessEntry32A* LPProcessEntry32A;
+
 typedef BOOL (WINAPI *IsDebuggerPresent_t)(void);
 typedef BOOL (WINAPI *CheckRemoteDebuggerPresent_t)(HANDLE, PBOOL);
 typedef void (WINAPI *OutputDebugStringA_t)(LPCSTR);
 typedef void (WINAPI *OutputDebugStringW_t)(LPCWSTR);
-typedef BOOL (WINAPI *Process32FirstA_t)(HANDLE, LPPROCESSENTRY32A);
+typedef BOOL (WINAPI *Process32FirstA_t)(HANDLE, LPProcessEntry32A);
 typedef BOOL (WINAPI *Process32FirstW_t)(HANDLE, LPPROCESSENTRY32W);
-typedef BOOL (WINAPI *Process32NextA_t)(HANDLE, LPPROCESSENTRY32A);
+typedef BOOL (WINAPI *Process32NextA_t)(HANDLE, LPProcessEntry32A);
 typedef BOOL (WINAPI *Process32NextW_t)(HANDLE, LPPROCESSENTRY32W);
 typedef BOOL (WINAPI *TerminateProcess_t)(HANDLE, UINT);
 typedef BOOL (WINAPI *EnumWindows_t)(WNDENUMPROC, LPARAM);
@@ -287,7 +307,7 @@ LONG NTAPI HookedNtQueryInformationProcess(HANDLE process, ULONG infoClass,
 // ---------------------------------------------------------------------------
 // The scanner (FUN_01086d90) only inspects the entries it is handed, so
 // skipping blocked names hides the tool completely.
-BOOL WINAPI HookedProcess32FirstA(HANDLE snapshot, LPPROCESSENTRY32A entry)
+BOOL WINAPI HookedProcess32FirstA(HANDLE snapshot, LPProcessEntry32A entry)
 {
 	if (!g_realProcess32FirstA(snapshot, entry)) return FALSE;
 	while (IsBlockedProcessNameA(entry->szExeFile))
@@ -297,7 +317,7 @@ BOOL WINAPI HookedProcess32FirstA(HANDLE snapshot, LPPROCESSENTRY32A entry)
 	return TRUE;
 }
 
-BOOL WINAPI HookedProcess32NextA(HANDLE snapshot, LPPROCESSENTRY32A entry)
+BOOL WINAPI HookedProcess32NextA(HANDLE snapshot, LPProcessEntry32A entry)
 {
 	while (g_realProcess32NextA(snapshot, entry))
 	{
