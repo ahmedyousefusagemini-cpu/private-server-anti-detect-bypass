@@ -236,6 +236,41 @@ GetWindowTextW_t             g_realGetWindowTextW             = nullptr;
 NtQueryInformationProcess_t  g_realNtQueryInformationProcess  = nullptr;
 
 // ---------------------------------------------------------------------------
+// Safe handle -> PID resolution
+// ---------------------------------------------------------------------------
+// IMPORTANT: never call GetProcessId() from inside the NtQueryInformationProcess
+// hook. GetProcessId is itself implemented on top of NtQueryInformationProcess,
+// so doing so recurses into our own hook until the stack overflows and the game
+// dies instantly. Resolve the PID through the original (trampoline) instead.
+struct ProcessBasicInformation_t
+{
+	LONG      ExitStatus;
+	PVOID     PebBaseAddress;
+	ULONG_PTR AffinityMask;
+	LONG      BasePriority;
+	ULONG_PTR UniqueProcessId;
+	ULONG_PTR InheritedFromUniqueProcessId;
+};
+
+DWORD GetPidSafe(HANDLE process)
+{
+	// (HANDLE)-1 is the current-process pseudo handle; GetCurrentProcessId()
+	// reads the TEB and never calls NtQueryInformationProcess.
+	if (!process || process == (HANDLE)(LONG_PTR)-1 || process == GetCurrentProcess())
+		return GetCurrentProcessId();
+
+	if (!g_realNtQueryInformationProcess)
+		return 0;
+
+	ProcessBasicInformation_t pbi;
+	memset(&pbi, 0, sizeof(pbi));
+	// ProcessBasicInformation == 0. Calling the trampoline does not recurse.
+	if (g_realNtQueryInformationProcess(process, 0, &pbi, sizeof(pbi), NULL) < 0)
+		return 0;
+	return (DWORD)(ULONG_PTR)pbi.UniqueProcessId;
+}
+
+// ---------------------------------------------------------------------------
 // Debugger hiding
 // ---------------------------------------------------------------------------
 // Clears PEB->BeingDebugged and the heap-debug bits of PEB->NtGlobalFlag.
@@ -281,8 +316,12 @@ LONG NTAPI HookedNtQueryInformationProcess(HANDLE process, ULONG infoClass,
 {
 	LONG status = g_realNtQueryInformationProcess(process, infoClass, info, infoLength, returnLength);
 
-	DWORD pid = GetProcessId(process);
-	if (pid != GetCurrentProcessId() && process != (HANDLE)(LONG_PTR)-1)
+	// Only the debug-info classes need touching and they are rare, so the
+	// common path costs nothing extra.
+	if (infoClass != 7 && infoClass != 0x1E && infoClass != 0x1F)
+		return status;
+
+	if (GetPidSafe(process) != GetCurrentProcessId())
 		return status;
 
 	switch (infoClass)
@@ -441,8 +480,9 @@ int WINAPI HookedGetClassNameA(HWND hwnd, LPSTR text, int maxCount)
 // Refuse to let the process terminate itself.
 BOOL WINAPI HookedTerminateProcess(HANDLE process, UINT exitCode)
 {
-	// (HANDLE)-1 is the current-process pseudo handle.
-	if (process == (HANDLE)(LONG_PTR)-1 || GetProcessId(process) == GetCurrentProcessId())
+	// GetPidSafe, not GetProcessId: the latter goes through
+	// NtQueryInformationProcess and would recurse into our hook.
+	if (GetPidSafe(process) == GetCurrentProcessId())
 	{
 		HookLog("[AntiDetect] blocked TerminateProcess on self (code %u)", exitCode);
 		return TRUE;

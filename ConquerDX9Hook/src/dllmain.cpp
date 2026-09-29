@@ -23,6 +23,15 @@ extern HRESULT WINAPI HookedReset(LPDIRECT3DDEVICE9 device, D3DPRESENT_PARAMETER
 
 void HookInitializationThread()
 {
+	// Install the anti-detection hooks FIRST, before anything else.
+	// The client's anti-cheat runs its early checks within roughly a second of
+	// startup; waiting for d3d9.dll and then scanning its 1 MB image for the VMT
+	// pattern takes long enough that a check firing in that window would run
+	// before our hooks existed.
+	MH_STATUS sh = MH_Initialize();
+	if (sh != MH_OK && sh != MH_ERROR_ALREADY_INITIALIZED) HookLog("MH_Initialize failed %d", sh);
+	AntiDetect::Install();
+
 	HMODULE direct3D9ModuleHandle = nullptr;
 
 	while (!(direct3D9ModuleHandle = GetModuleHandleA("d3d9.dll")))
@@ -103,13 +112,6 @@ void HookInitializationThread()
 	g_originalEndSceneAddress = (LPVOID)originalEndSceneFunc;
 	g_originalResetAddress = (LPVOID)originalResetFunc;
 
-
-	MH_STATUS sh = MH_Initialize();
-	if (sh!=MH_OK && sh!=MH_ERROR_ALREADY_INITIALIZED) HookLog("MH_Initialize failed %d", sh);
-
-	// Anti-detection module: install debugger-hiding / Cheat-Engine-evasion
-	// hooks here (stub for now).
-	AntiDetect::Install();
 
 	sh = MH_CreateHook(g_originalEndSceneAddress, (LPVOID)HookedEndScene, (LPVOID*)&g_originalEndSceneFunction);
 	HookLog("CreateHook EndScene %p -> %d", g_originalEndSceneAddress, sh);
