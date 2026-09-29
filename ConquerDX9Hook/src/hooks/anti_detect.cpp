@@ -103,12 +103,25 @@ bool ContainsInsensitive(const char* haystack, const char* needleLower)
 	return false;
 }
 
-bool IsBlockedProcessName(const char* exeName)
+bool IsBlockedProcessNameA(const char* exeName)
 {
 	for (size_t i = 0; i < _countof(kBlockedProcessSubstrings); ++i)
 		if (ContainsInsensitive(exeName, kBlockedProcessSubstrings[i]))
 			return true;
 	return false;
+}
+
+// kernel32 exports the unsuffixed "Process32First"/"Process32Next" as the ANSI
+// variant and "Process32FirstW"/"Process32NextW" as the wide one (there is no
+// Process32FirstA export). Conquer.exe uses the ANSI one - FUN_01086d90 compares
+// the name with strlen/strstr - but both are hooked.
+bool IsBlockedProcessNameW(const wchar_t* exeName)
+{
+	if (!exeName) return false;
+	char narrow[MAX_PATH];
+	if (WideCharToMultiByte(CP_ACP, 0, exeName, -1, narrow, sizeof(narrow), NULL, NULL) <= 0)
+		return false;
+	return IsBlockedProcessNameA(narrow);
 }
 
 bool IsBlockedWindowString(const char* text)
@@ -152,7 +165,7 @@ bool IsBlockedWindow(HWND hwnd)
 	if (exe[0])
 	{
 		const char* base = strrchr(exe, '\\');
-		if (IsBlockedProcessName(base ? base + 1 : exe)) return true;
+		if (IsBlockedProcessNameA(base ? base + 1 : exe)) return true;
 	}
 
 	char cls[256];
@@ -172,8 +185,10 @@ typedef BOOL (WINAPI *IsDebuggerPresent_t)(void);
 typedef BOOL (WINAPI *CheckRemoteDebuggerPresent_t)(HANDLE, PBOOL);
 typedef void (WINAPI *OutputDebugStringA_t)(LPCSTR);
 typedef void (WINAPI *OutputDebugStringW_t)(LPCWSTR);
-typedef BOOL (WINAPI *Process32First_t)(HANDLE, LPPROCESSENTRY32);
-typedef BOOL (WINAPI *Process32Next_t)(HANDLE, LPPROCESSENTRY32);
+typedef BOOL (WINAPI *Process32FirstA_t)(HANDLE, LPPROCESSENTRY32A);
+typedef BOOL (WINAPI *Process32FirstW_t)(HANDLE, LPPROCESSENTRY32W);
+typedef BOOL (WINAPI *Process32NextA_t)(HANDLE, LPPROCESSENTRY32A);
+typedef BOOL (WINAPI *Process32NextW_t)(HANDLE, LPPROCESSENTRY32W);
 typedef BOOL (WINAPI *TerminateProcess_t)(HANDLE, UINT);
 typedef BOOL (WINAPI *EnumWindows_t)(WNDENUMPROC, LPARAM);
 typedef BOOL (WINAPI *EnumChildWindows_t)(HWND, WNDENUMPROC, LPARAM);
@@ -187,8 +202,10 @@ IsDebuggerPresent_t          g_realIsDebuggerPresent          = nullptr;
 CheckRemoteDebuggerPresent_t g_realCheckRemoteDebuggerPresent = nullptr;
 OutputDebugStringA_t         g_realOutputDebugStringA         = nullptr;
 OutputDebugStringW_t         g_realOutputDebugStringW         = nullptr;
-Process32First_t             g_realProcess32First             = nullptr;
-Process32Next_t              g_realProcess32Next              = nullptr;
+Process32FirstA_t             g_realProcess32FirstA             = nullptr;
+Process32FirstW_t             g_realProcess32FirstW             = nullptr;
+Process32NextA_t              g_realProcess32NextA              = nullptr;
+Process32NextW_t              g_realProcess32NextW              = nullptr;
 TerminateProcess_t           g_realTerminateProcess           = nullptr;
 EnumWindows_t                g_realEnumWindows                = nullptr;
 EnumChildWindows_t           g_realEnumChildWindows           = nullptr;
@@ -270,21 +287,40 @@ LONG NTAPI HookedNtQueryInformationProcess(HANDLE process, ULONG infoClass,
 // ---------------------------------------------------------------------------
 // The scanner (FUN_01086d90) only inspects the entries it is handed, so
 // skipping blocked names hides the tool completely.
-BOOL WINAPI HookedProcess32First(HANDLE snapshot, LPPROCESSENTRY32 entry)
+BOOL WINAPI HookedProcess32FirstA(HANDLE snapshot, LPPROCESSENTRY32A entry)
 {
-	if (!g_realProcess32First(snapshot, entry)) return FALSE;
-	while (IsBlockedProcessName(entry->szExeFile))
+	if (!g_realProcess32FirstA(snapshot, entry)) return FALSE;
+	while (IsBlockedProcessNameA(entry->szExeFile))
 	{
-		if (!g_realProcess32Next(snapshot, entry)) return FALSE;
+		if (!g_realProcess32NextA(snapshot, entry)) return FALSE;
 	}
 	return TRUE;
 }
 
-BOOL WINAPI HookedProcess32Next(HANDLE snapshot, LPPROCESSENTRY32 entry)
+BOOL WINAPI HookedProcess32NextA(HANDLE snapshot, LPPROCESSENTRY32A entry)
 {
-	while (g_realProcess32Next(snapshot, entry))
+	while (g_realProcess32NextA(snapshot, entry))
 	{
-		if (!IsBlockedProcessName(entry->szExeFile)) return TRUE;
+		if (!IsBlockedProcessNameA(entry->szExeFile)) return TRUE;
+	}
+	return FALSE;
+}
+
+BOOL WINAPI HookedProcess32FirstW(HANDLE snapshot, LPPROCESSENTRY32W entry)
+{
+	if (!g_realProcess32FirstW(snapshot, entry)) return FALSE;
+	while (IsBlockedProcessNameW(entry->szExeFile))
+	{
+		if (!g_realProcess32NextW(snapshot, entry)) return FALSE;
+	}
+	return TRUE;
+}
+
+BOOL WINAPI HookedProcess32NextW(HANDLE snapshot, LPPROCESSENTRY32W entry)
+{
+	while (g_realProcess32NextW(snapshot, entry))
+	{
+		if (!IsBlockedProcessNameW(entry->szExeFile)) return TRUE;
 	}
 	return FALSE;
 }
@@ -412,6 +448,12 @@ void InstallHook(const char* module, const char* name, LPVOID detour, LPVOID* or
 		return;
 	}
 	MH_STATUS st = MH_CreateHook(target, detour, original);
+	if (st == MH_ERROR_ALREADY_CREATED || st == MH_ERROR_ENABLED)
+	{
+		// e.g. "Process32First" and "Process32FirstA" can alias one address.
+		HookLog("[AntiDetect] %s!%s already hooked - skipped", module, name);
+		return;
+	}
 	if (st != MH_OK)
 	{
 		HookLog("[AntiDetect] CreateHook %s failed (%d)", name, st);
@@ -442,10 +484,21 @@ namespace AntiDetect {
 			(LPVOID)HookedNtQueryInformationProcess, (LPVOID*)&g_realNtQueryInformationProcess);
 
 		// --- process enumeration filter ---
+		// Conquer.exe imports the unsuffixed (ANSI) names; hook the plain and
+		// the W exports so every code path is covered. GetProcAddress returns
+		// NULL for names that do not exist and InstallHook skips them.
 		InstallHook("kernel32.dll", "Process32First",
-			(LPVOID)HookedProcess32First, (LPVOID*)&g_realProcess32First);
+			(LPVOID)HookedProcess32FirstA, (LPVOID*)&g_realProcess32FirstA);
+		InstallHook("kernel32.dll", "Process32FirstA",
+			(LPVOID)HookedProcess32FirstA, (LPVOID*)&g_realProcess32FirstA);
+		InstallHook("kernel32.dll", "Process32FirstW",
+			(LPVOID)HookedProcess32FirstW, (LPVOID*)&g_realProcess32FirstW);
 		InstallHook("kernel32.dll", "Process32Next",
-			(LPVOID)HookedProcess32Next, (LPVOID*)&g_realProcess32Next);
+			(LPVOID)HookedProcess32NextA, (LPVOID*)&g_realProcess32NextA);
+		InstallHook("kernel32.dll", "Process32NextA",
+			(LPVOID)HookedProcess32NextA, (LPVOID*)&g_realProcess32NextA);
+		InstallHook("kernel32.dll", "Process32NextW",
+			(LPVOID)HookedProcess32NextW, (LPVOID*)&g_realProcess32NextW);
 
 		// --- window enumeration / lookup filter ---
 		InstallHook("user32.dll", "EnumWindows",
