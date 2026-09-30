@@ -2,8 +2,8 @@
 #include <cstdio>
 #include <cstdarg>
 #include "hooks/common.h"
-#include "hooks/anti_detect.h"
 #include "hooks/log.h"
+#include "hooks/packet_capture.h"
 #include "MinHook.h"
 
 #pragma comment(lib, "d3d9.lib")
@@ -23,12 +23,13 @@ extern HRESULT WINAPI HookedReset(LPDIRECT3DDEVICE9 device, D3DPRESENT_PARAMETER
 
 void HookInitializationThread()
 {
-	// The DllMain pass already installed everything it could. Re-run now that the
-	// loader lock is gone and LoadLibrary is safe, to fill in any module that was
-	// not mapped yet.
 	MH_STATUS sh = MH_Initialize();
 	if (sh != MH_OK && sh != MH_ERROR_ALREADY_INITIALIZED) HookLog("MH_Initialize failed %d", sh);
-	AntiDetect::InstallLate();
+
+	// Install the packet hooks. The targets live in the main executable, which
+	// is mapped from the very first instruction, so this can run as soon as
+	// MinHook is up.
+	PacketCapture::Install();
 
 	HMODULE direct3D9ModuleHandle = nullptr;
 
@@ -120,30 +121,6 @@ void HookInitializationThread()
 	HookLog("EnableHook EndScene %d", sh);
 	sh = MH_EnableHook(g_originalResetAddress);
 	HookLog("EnableHook Reset %d", sh);
-
-	// Neutralise ndac.dll's INT 1 self-terminate once it has loaded. Polled from
-	// THIS (already existing) thread on purpose: adding another thread makes the
-	// client die faster, because ndac enumerates threads via Thread32First/
-	// Thread32Next. See AntiDetect::PatchNdacInt1().
-	bool ndacPatched = false;
-	while (true)
-	{
-		if (!ndacPatched)
-		{
-			if (AntiDetect::PatchNdacInt1() > 0)
-			{
-				ndacPatched = true;
-				HookLog("ndac INT1 neutralised");
-			}
-			Sleep(1000);
-		}
-		else
-		{
-			// Re-assert occasionally in case ndac restores its own bytes.
-			Sleep(5000);
-			AntiDetect::PatchNdacInt1();
-		}
-	}
 }
 
 
@@ -154,16 +131,6 @@ BOOL APIENTRY DllMain(HMODULE moduleHandle, DWORD reason, LPVOID reserved)
 	case DLL_PROCESS_ATTACH:
 
 		DisableThreadLibraryCalls(moduleHandle);
-
-		// Install the anti-detection hooks HERE, synchronously, before any of the
-		// client's code runs. A thread created inside DllMain does not start
-		// until the loader lock is released - which happens after the process
-		// entry point - and the client's anti-cheat (ndac.dll) was observed
-		// running immediately after the entry point. Installing from the init
-		// thread below therefore loses that race.
-		// AntiDetect::Install() deliberately never calls LoadLibrary, so it is
-		// safe to run while the loader lock is held.
-		AntiDetect::Install();
 
 		CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)HookInitializationThread, NULL, 0, NULL);
 		break;

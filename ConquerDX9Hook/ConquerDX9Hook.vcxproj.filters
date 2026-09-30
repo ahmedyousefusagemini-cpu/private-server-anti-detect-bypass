@@ -50,7 +50,10 @@
     <ClInclude Include="src\hooks\log.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="src\hooks\anti_detect.h">
+    <ClInclude Include="src\hooks\packet_capture.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\hooks\packet_overlay.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
@@ -70,7 +73,10 @@
     <ClCompile Include="src\hooks\log.cpp">
       <Filter>Source Files\hooks</Filter>
     </ClCompile>
-    <ClCompile Include="src\hooks\anti_detect.cpp">
+    <ClCompile Include="src\hooks\packet_capture.cpp">
+      <Filter>Source Files\hooks</Filter>
+    </ClCompile>
+    <ClCompile Include="src\hooks\packet_overlay.cpp">
       <Filter>Source Files\hooks</Filter>
     </ClCompile>
     <ClCompile Include="libs\minhook\src\hook.c">
