@@ -734,6 +734,93 @@ namespace AntiDetect {
 		HookLog("[AntiDetect] InstallLate() complete");
 	}
 
+	// -----------------------------------------------------------------------
+	// Neutralise ndac.dll's INT 1 self-terminate
+	// -----------------------------------------------------------------------
+	// ndac.dll kills the client once it decides a debugger is present. The stub
+	// it runs (found by disassembling ndac+0x245DA3 at runtime) is:
+	//
+	//     CD 01                    int 1          <- raises the unhandled exception
+	//     E8 ?? ?? ?? ??           call ...
+	//     89 84 2A 02 00 C3 FF     mov [edx+ebp-0x3CFFFE], eax
+	//     58                       pop eax
+	//     05 E5 7F 0B 00           add eax, 0xB7FE5     (position-independent stub)
+	//     FF E0                    jmp eax
+	//
+	// We scan ndac's executable sections for that fixed tail and replace the
+	// leading `CD 01` with two NOPs, so the path becomes a no-op instead of a
+	// process kill.
+	//
+	// Runs from the EXISTING init thread on purpose - adding a thread was
+	// measured to make the client die faster (ndac imports Thread32First/
+	// Thread32Next and enumerates threads).
+	//
+	// CAVEAT: ndac is a VM protector with encrypted sections; it may
+	// integrity-check its own code, in which case this patch trips a different
+	// detection. Returns the number of sites patched (0 = not found / not yet
+	// loaded).
+	int PatchNdacInt1()
+	{
+		HMODULE ndac = GetModuleHandleA("ndac.dll");
+		if (!ndac) return 0;
+
+		PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)ndac;
+		if (!dos || dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+		PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)((BYTE*)ndac + dos->e_lfanew);
+		if (!nt || nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+
+		// Fixed 15-byte tail that immediately follows the INT 1 stub.
+		static const unsigned char kTail[15] = {
+			0x89, 0x84, 0x2A, 0x02, 0x00, 0xC3, 0xFF,   // mov [edx+ebp-0x3CFFFE], eax
+			0x58,                                       // pop eax
+			0x05, 0xE5, 0x7F, 0x0B, 0x00,               // add eax, 0xB7FE5
+			0xFF, 0xE0                                  // jmp eax
+		};
+
+		int patched = 0;
+		PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(nt);
+
+		for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i)
+		{
+			// Only executable sections can hold the stub, and they are readable.
+			if (!(sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+
+			BYTE* base = (BYTE*)ndac + sec[i].VirtualAddress;
+			DWORD size = sec[i].Misc.VirtualSize ? sec[i].Misc.VirtualSize : sec[i].SizeOfRawData;
+			if (size <= sizeof(kTail)) continue;
+
+			for (DWORD off = 0; off + sizeof(kTail) <= size; ++off)
+			{
+				if (memcmp(base + off, kTail, sizeof(kTail)) != 0) continue;
+
+				// The tail starts 7 bytes into the stub, so the INT 1 is at
+				// off-7 and the `E8` call opcode at off-5.
+				if (off < 7) continue;
+				BYTE* stub = base + off - 7;
+				if (stub[0] != 0xCD || stub[1] != 0x01 || stub[2] != 0xE8) continue;
+
+				DWORD oldProtect = 0;
+				if (!VirtualProtect(stub, 2, PAGE_EXECUTE_READWRITE, &oldProtect))
+				{
+					HookLog("[AntiDetect] ndac INT1: VirtualProtect failed (%lu)", GetLastError());
+					continue;
+				}
+				stub[0] = 0x90;   // NOP
+				stub[1] = 0x90;   // NOP
+				VirtualProtect(stub, 2, oldProtect, &oldProtect);
+				FlushInstructionCache(GetCurrentProcess(), stub, 2);
+
+				++patched;
+				HookLog("[AntiDetect] ndac INT1 patched at %p (ndac+0x%X)",
+					(void*)stub, (unsigned)((BYTE*)stub - (BYTE*)ndac));
+			}
+		}
+
+		if (patched)
+			HookLog("[AntiDetect] ndac INT1: %d site(s) neutralised", patched);
+		return patched;
+	}
+
 	void PerFrame()
 	{
 		// Re-assert the PEB flags about once a second: attaching a debugger (or

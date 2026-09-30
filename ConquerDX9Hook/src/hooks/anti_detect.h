@@ -41,4 +41,14 @@ namespace AntiDetect {
 
 	// Called every frame from HookedEndScene (game thread).
 	void PerFrame();
+
+	// Scans ndac.dll's executable sections for its INT 1 self-terminate stub
+	// (the instruction at ndac+0x245DA3) and replaces the INT 1 with two NOPs,
+	// so the kill path becomes a no-op.
+	//
+	// Returns the number of sites patched; 0 means ndac is not loaded yet or the
+	// pattern was not found. Safe to call repeatedly - call it from the EXISTING
+	// init thread (adding a thread makes ndac kill the client faster, because it
+	// enumerates threads via Thread32First/Thread32Next).
+	int PatchNdacInt1();
 }

@@ -121,9 +121,28 @@ void HookInitializationThread()
 	sh = MH_EnableHook(g_originalResetAddress);
 	HookLog("EnableHook Reset %d", sh);
 
+	// Neutralise ndac.dll's INT 1 self-terminate once it has loaded. Polled from
+	// THIS (already existing) thread on purpose: adding another thread makes the
+	// client die faster, because ndac enumerates threads via Thread32First/
+	// Thread32Next. See AntiDetect::PatchNdacInt1().
+	bool ndacPatched = false;
 	while (true)
 	{
-		Sleep(1000);
+		if (!ndacPatched)
+		{
+			if (AntiDetect::PatchNdacInt1() > 0)
+			{
+				ndacPatched = true;
+				HookLog("ndac INT1 neutralised");
+			}
+			Sleep(1000);
+		}
+		else
+		{
+			// Re-assert occasionally in case ndac restores its own bytes.
+			Sleep(5000);
+			AntiDetect::PatchNdacInt1();
+		}
 	}
 }
 
