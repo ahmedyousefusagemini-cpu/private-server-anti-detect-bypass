@@ -333,25 +333,12 @@ void ClearPebDebugFlags()
 	*(DWORD*)(peb + 0x68) &= ~0x70u;  // PEB->NtGlobalFlag (FLG_HEAP_*)
 }
 
-// Keeps the PEB debug flags clear continuously.
-//
-// Clearing them only in Install() and once per rendered frame is not enough for
-// the ATTACH case. When a debugger attaches to an already-running client the
-// kernel sets PEB.BeingDebugged itself (there is no user-mode API to hook), and
-// x64dbg suspends every thread on attach - so an EndScene-driven scrub stops
-// running at exactly the moment it is needed. ndac's detection does not go
-// through the hooked debug APIs (those are live and return clean), which points
-// at a direct PEB read. This thread re-clears the flags as soon as execution
-// resumes.
-DWORD WINAPI PebWatchdogThread(LPVOID)
-{
-	for (;;)
-	{
-		ClearPebDebugFlags();
-		Sleep(10);   // 100 Hz - negligible cost
-	}
-	return 0;
-}
+// NOTE: a continuous PEB-scrub watchdog thread was tried here and REVERTED.
+// It made things strictly worse - the client died within ~4 s of resuming
+// instead of reaching ~500 MB. ndac.dll imports Thread32First/Thread32Next
+// (thread enumeration), so adding a second thread to the process handed it an
+// easy signal. Keep the process's thread count unchanged: scrub the PEB only
+// from Install() and from the existing EndScene-driven PerFrame().
 
 BOOL WINAPI HookedIsDebuggerPresent(void)
 {
@@ -734,18 +721,6 @@ namespace AntiDetect {
 			HookLog("[AntiDetect] MH_Initialize failed (%d)", initStatus);
 
 		InstallAllHooks();
-
-		// Start the PEB watchdog exactly once (Install() runs twice: from
-		// DllMain, then again via InstallLate()).
-		static bool watchdogStarted = false;
-		if (!watchdogStarted)
-		{
-			watchdogStarted = true;
-			HANDLE h = CreateThread(NULL, 0, PebWatchdogThread, NULL, 0, NULL);
-			if (h) CloseHandle(h);
-			HookLog("[AntiDetect] PEB watchdog thread started");
-		}
-
 		HookLog("[AntiDetect] Install() (early, from DllMain) complete");
 	}
 
