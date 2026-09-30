@@ -217,6 +217,13 @@ typedef HWND (WINAPI *FindWindowW_t)(LPCWSTR, LPCWSTR);
 typedef int  (WINAPI *GetWindowTextA_t)(HWND, LPSTR, int);
 typedef int  (WINAPI *GetWindowTextW_t)(HWND, LPWSTR, int);
 typedef LONG (NTAPI  *NtQueryInformationProcess_t)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+// PSAPI. ndac.dll imports these statically, so they must be covered: this is
+// how a running Cheat Engine is found (EnumProcesses -> OpenProcess ->
+// GetModuleBaseNameW, matched against a name list).
+typedef BOOL  (WINAPI *EnumProcesses_t)(DWORD*, DWORD, DWORD*);
+typedef DWORD (WINAPI *GetModuleBaseNameA_t)(HANDLE, HMODULE, LPSTR, DWORD);
+typedef DWORD (WINAPI *GetModuleBaseNameW_t)(HANDLE, HMODULE, LPWSTR, DWORD);
+typedef HANDLE(WINAPI *OpenProcess_t)(DWORD, BOOL, DWORD);
 
 IsDebuggerPresent_t          g_realIsDebuggerPresent          = nullptr;
 CheckRemoteDebuggerPresent_t g_realCheckRemoteDebuggerPresent = nullptr;
@@ -234,6 +241,10 @@ FindWindowW_t                g_realFindWindowW                = nullptr;
 GetWindowTextA_t             g_realGetWindowTextA             = nullptr;
 GetWindowTextW_t             g_realGetWindowTextW             = nullptr;
 NtQueryInformationProcess_t  g_realNtQueryInformationProcess  = nullptr;
+EnumProcesses_t              g_realEnumProcesses              = nullptr;
+GetModuleBaseNameA_t         g_realGetModuleBaseNameA         = nullptr;
+GetModuleBaseNameW_t         g_realGetModuleBaseNameW         = nullptr;
+OpenProcess_t                g_realOpenProcess                = nullptr;
 
 // ---------------------------------------------------------------------------
 // Safe handle -> PID resolution
@@ -269,6 +280,41 @@ DWORD GetPidSafe(HANDLE process)
 		return 0;
 	return (DWORD)(ULONG_PTR)pbi.UniqueProcessId;
 }
+
+// ---------------------------------------------------------------------------
+// PID -> image name, and "is this a tool we are hiding?"
+// ---------------------------------------------------------------------------
+// Uses only unhooked calls: g_realOpenProcess (trampoline) + the plain
+// QueryFullProcessImageNameA + CloseHandle. Never OpenProcess directly - that
+// is itself hooked below.
+bool GetPidImageName(DWORD pid, char* out, size_t outSize)
+{
+	out[0] = '\0';
+	if (!pid || pid == GetCurrentProcessId()) return false;
+	if (!g_realOpenProcess) return false;
+
+	HANDLE h = g_realOpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+	if (!h) return false;
+	DWORD len = (DWORD)outSize;
+	BOOL ok = QueryFullProcessImageNameA(h, 0, out, &len);
+	CloseHandle(h);
+	if (!ok) out[0] = '\0';
+	return ok != FALSE;
+}
+
+// Fails open: if the name cannot be resolved we do not hide anything, so a
+// resolution failure can never break legitimate callers.
+bool IsBlockedPid(DWORD pid)
+{
+	char name[MAX_PATH];
+	if (!GetPidImageName(pid, name, sizeof(name))) return false;
+	const char* base = strrchr(name, '\\');
+	return IsBlockedProcessNameA(base ? base + 1 : name);
+}
+
+// Replacement shown to the scanner instead of the real tool name.
+const char kBenignNameA[] = "svchost.exe";
+const wchar_t kBenignNameW[] = L"svchost.exe";
 
 // ---------------------------------------------------------------------------
 // Debugger hiding
@@ -385,6 +431,56 @@ BOOL WINAPI HookedProcess32NextW(HANDLE snapshot, LPPROCESSENTRY32W entry)
 }
 
 // ---------------------------------------------------------------------------
+// PSAPI process-scan filter
+// ---------------------------------------------------------------------------
+// ndac.dll's scanner (RTTI: CProcessStringInfoStream / CProcessModuleInfoStream
+// / CWindowInfoStream) walks processes with EnumProcesses, opens each one and
+// reads its base name against a list. Hide the tool at every step of that
+// chain - this is the path a merely-running Cheat Engine is caught by.
+BOOL WINAPI HookedEnumProcesses(DWORD* pids, DWORD cb, LPDWORD needed)
+{
+	if (!g_realEnumProcesses(pids, cb, needed)) return FALSE;
+	if (!pids || !needed) return TRUE;
+
+	DWORD count = *needed / sizeof(DWORD);
+	DWORD write = 0;
+	for (DWORD i = 0; i < count; ++i)
+	{
+		if (!IsBlockedPid(pids[i]))
+			pids[write++] = pids[i];
+	}
+	*needed = write * sizeof(DWORD);
+	return TRUE;
+}
+
+DWORD WINAPI HookedGetModuleBaseNameA(HANDLE process, HMODULE module, LPSTR name, DWORD size)
+{
+	DWORD r = g_realGetModuleBaseNameA(process, module, name, size);
+	if (r && name && size > 0 && IsBlockedProcessNameA(name))
+		lstrcpynA(name, kBenignNameA, (int)size);   // harmless name, no match
+	return r;
+}
+
+DWORD WINAPI HookedGetModuleBaseNameW(HANDLE process, HMODULE module, LPWSTR name, DWORD size)
+{
+	DWORD r = g_realGetModuleBaseNameW(process, module, name, size);
+	if (r && name && size > 0 && IsBlockedProcessNameW(name))
+		lstrcpynW(name, kBenignNameW, (int)size);
+	return r;
+}
+
+// Deny the scanner a handle to the tool in the first place.
+HANDLE WINAPI HookedOpenProcess(DWORD access, BOOL inherit, DWORD pid)
+{
+	if (IsBlockedPid(pid))
+	{
+		SetLastError(ERROR_ACCESS_DENIED);
+		return NULL;
+	}
+	return g_realOpenProcess(access, inherit, pid);
+}
+
+// ---------------------------------------------------------------------------
 // Window enumeration / lookup filter
 // ---------------------------------------------------------------------------
 struct EnumContext
@@ -495,7 +591,11 @@ BOOL WINAPI HookedTerminateProcess(HANDLE process, UINT exitCode)
 // ---------------------------------------------------------------------------
 void InstallHook(const char* module, const char* name, LPVOID detour, LPVOID* original)
 {
+	// Install() runs at the very top of the init thread, so a module we want may
+	// not be mapped yet (we deliberately run before the d3d9 wait). Pull it in
+	// rather than silently skipping the hook.
 	HMODULE mod = GetModuleHandleA(module);
+	if (!mod) mod = LoadLibraryA(module);
 	if (!mod)
 	{
 		HookLog("[AntiDetect] %s not loaded - skipping %s", module, name);
@@ -559,6 +659,19 @@ namespace AntiDetect {
 			(LPVOID)HookedProcess32NextA, (LPVOID*)&g_realProcess32NextA);
 		InstallHook("kernel32.dll", "Process32NextW",
 			(LPVOID)HookedProcess32NextW, (LPVOID*)&g_realProcess32NextW);
+
+		// --- PSAPI process-scan filter ---
+		// OpenProcess first: IsBlockedPid resolves image names through the
+		// g_realOpenProcess trampoline, so it must exist before the filters that
+		// depend on it go live.
+		InstallHook("kernel32.dll", "OpenProcess",
+			(LPVOID)HookedOpenProcess, (LPVOID*)&g_realOpenProcess);
+		InstallHook("psapi.dll", "EnumProcesses",
+			(LPVOID)HookedEnumProcesses, (LPVOID*)&g_realEnumProcesses);
+		InstallHook("psapi.dll", "GetModuleBaseNameA",
+			(LPVOID)HookedGetModuleBaseNameA, (LPVOID*)&g_realGetModuleBaseNameA);
+		InstallHook("psapi.dll", "GetModuleBaseNameW",
+			(LPVOID)HookedGetModuleBaseNameW, (LPVOID*)&g_realGetModuleBaseNameW);
 
 		// --- window enumeration / lookup filter ---
 		InstallHook("user32.dll", "EnumWindows",
