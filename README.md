@@ -47,10 +47,19 @@ immediately after the length header.
 | `F9` | pause / resume capture |
 | `F10` | clear the list |
 | `Esc` | hide the window |
+| `[X]` in the title bar | hide the window (mouse-only fallback) |
 | mouse wheel | scroll (scrolling up detaches auto-follow) |
 | click a row | select it — hex dump appears in the bottom pane |
 | drag the title bar | move the window |
 | middle click | hide the window |
+
+The hotkeys are **polled with `GetAsyncKeyState` once per frame**, not handled
+in the window procedure. Conquer drives its keyboard through DirectInput, so
+`WM_KEYDOWN` is not reliably delivered to the window the overlay subclasses —
+a message-based handler simply never fires. Polling the physical key state
+works regardless of how the client consumes input. Keys are only acted on
+while the game process owns the foreground, so the overlay will not toggle
+while you are typing in another window.
 
 The window swallows mouse input while the cursor is over it, so clicking a row
 does not also move your character.

@@ -55,6 +55,9 @@ namespace {
 	const int kDetailTitleH = 20;
 	const int kDetailLines = (kDetailH - kDetailTitleH - 6) / kRowH;
 
+	// Clickable close box at the right end of the title bar.
+	const int kCloseBoxW = 30;
+
 	// -----------------------------------------------------------------------
 	// Colours (COLORREF is 0x00BBGGRR; the DIB is 32bpp BGRX)
 	// -----------------------------------------------------------------------
@@ -338,9 +341,13 @@ namespace {
 		DrawTextClipped(280, 5, 320, kColDim, text);
 
 		if (paused)
-			DrawTextClipped(kPanelW - 320, 5, 60, kColWarn, "PAUSED");
+			DrawTextClipped(kPanelW - 390, 5, 70, kColWarn, "PAUSED");
 
-		DrawTextClipped(kPanelW - 250, 5, 240, kColDim, "[F8] hide  [F9] pause  [F10] clear");
+		DrawTextClipped(kPanelW - 315, 5, 275, kColDim, "[F8] hide  [F9] pause  [F10] clear");
+
+		// Clickable close box - a mouse-only way out in case the hotkeys are
+		// ever swallowed by the client's input handling.
+		DrawTextClipped(kPanelW - kCloseBoxW + 6, 5, kCloseBoxW - 6, kColDim, "[X]");
 
 		// Column header
 		FillRectC(0, kTitleH, kPanelW, kHeaderH, kColHeader);
@@ -635,6 +642,68 @@ namespace {
 			&& point.y >= g_panelY && point.y < g_panelY + kPanelH;
 	}
 
+	bool PointInCloseBox(const POINT& point)
+	{
+		return point.x >= g_panelX + kPanelW - kCloseBoxW
+			&& point.x < g_panelX + kPanelW
+			&& point.y >= g_panelY && point.y < g_panelY + kTitleH;
+	}
+
+	// -----------------------------------------------------------------------
+	// Hotkeys
+	// -----------------------------------------------------------------------
+	// Polled with GetAsyncKeyState instead of handled in the window procedure.
+	// Conquer drives its keyboard through DirectInput, so WM_KEYDOWN is not
+	// reliably delivered to the window we subclassed - a message-based F8
+	// handler simply never fires. Reading the physical key state works no
+	// matter how the game consumes input.
+	bool IsGameForeground()
+	{
+		HWND foreground = GetForegroundWindow();
+		if (!foreground) return false;
+
+		DWORD processId = 0;
+		GetWindowThreadProcessId(foreground, &processId);
+		return processId == GetCurrentProcessId();
+	}
+
+	// True only on the frame the key transitions from up to down, so holding
+	// the key does not repeat the action.
+	bool KeyPressedEdge(int virtualKey, bool& wasDown)
+	{
+		bool down = (GetAsyncKeyState(virtualKey) & 0x8000) != 0;
+		bool pressed = down && !wasDown;
+		wasDown = down;
+		return pressed;
+	}
+
+	void PollHotkeys()
+	{
+		static bool f8Down = false;
+		static bool f9Down = false;
+		static bool f10Down = false;
+		static bool escapeDown = false;
+		static bool middleDown = false;
+
+		// Always sample, so the edge state stays correct even while another
+		// window has focus and we deliberately ignore the result.
+		bool f8 = KeyPressedEdge(VK_F8, f8Down);
+		bool f9 = KeyPressedEdge(VK_F9, f9Down);
+		bool f10 = KeyPressedEdge(VK_F10, f10Down);
+		bool escape = KeyPressedEdge(VK_ESCAPE, escapeDown);
+		bool middle = KeyPressedEdge(VK_MBUTTON, middleDown);
+
+		// Only act while the game owns the foreground, so the overlay does not
+		// toggle while the user is typing in some other application.
+		if (!IsGameForeground()) return;
+
+		if (f8)  { g_visible = !g_visible; g_dirty = true; }
+		if (f9)  { SetPaused(!IsPaused()); g_dirty = true; }
+		if (f10) { Clear(); g_hasSelection = false; g_scrollFromEnd = 0; g_dirty = true; }
+		if (escape && g_visible) { g_visible = false; g_dirty = true; }
+		if (middle && g_visible) { g_visible = false; g_dirty = true; }
+	}
+
 	void ClampPanel()
 	{
 		int maxX = (g_backbufferW > 0 ? g_backbufferW : 1280) - 60;
@@ -715,6 +784,10 @@ void OnEndScene(LPDIRECT3DDEVICE9 device)
 		g_dirty = true;
 	}
 
+	// Poll the hotkeys BEFORE the visibility check - otherwise F8 could never
+	// bring the window back once it has been hidden.
+	PollHotkeys();
+
 	if (!g_visible) return;
 
 	// Lazily build the panel resources, retrying each frame until they exist
@@ -793,36 +866,10 @@ bool OnWindowMessage(HWND windowHandle, UINT message, WPARAM wParam, LPARAM lPar
 {
 	switch (message)
 	{
-	case WM_KEYDOWN:
-	case WM_SYSKEYDOWN:
-		switch (wParam)
-		{
-		case VK_F8:
-			g_visible = !g_visible;
-			g_dirty = true;
-			return true;
-		case VK_F9:
-			SetPaused(!IsPaused());
-			g_dirty = true;
-			return true;
-		case VK_F10:
-			Clear();
-			g_hasSelection = false;
-			g_scrollFromEnd = 0;
-			g_dirty = true;
-			return true;
-		case VK_ESCAPE:
-			if (g_visible)
-			{
-				g_visible = false;
-				g_dirty = true;
-				return true;
-			}
-			break;
-		default:
-			break;
-		}
-		break;
+	// Keyboard hotkeys (F8/F9/F10/Esc) are NOT handled here - they are polled
+	// in PollHotkeys(), because the client consumes the keyboard through
+	// DirectInput and these messages are not reliably delivered. Handling them
+	// in both places would toggle twice per press.
 
 	case WM_MOUSEWHEEL:
 		if (g_visible)
@@ -835,22 +882,18 @@ bool OnWindowMessage(HWND windowHandle, UINT message, WPARAM wParam, LPARAM lPar
 		}
 		break;
 
-	case WM_MBUTTONDOWN:
-		if (g_visible)
-		{
-			g_visible = false;
-			g_dirty = true;
-			return true;
-		}
-		break;
-
 	case WM_LBUTTONDOWN:
 		if (g_visible)
 		{
 			POINT point;
 			if (CursorToOverlay(&point) && PointInPanel(point))
 			{
-				if (point.y < g_panelY + kTitleH)
+				if (PointInCloseBox(point))
+				{
+					g_visible = false;
+					g_dirty = true;
+				}
+				else if (point.y < g_panelY + kTitleH)
 				{
 					g_dragging = true;
 					g_dragCursor.x = point.x;
