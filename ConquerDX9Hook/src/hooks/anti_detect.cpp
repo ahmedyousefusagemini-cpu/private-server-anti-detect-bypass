@@ -5,6 +5,7 @@
 
 #include <windows.h>
 #include <tlhelp32.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <string>
@@ -103,12 +104,57 @@ bool ContainsInsensitive(const char* haystack, const char* needleLower)
 	return false;
 }
 
+// Defined below; used by the blocklist helpers to record who is looking.
+void LogBlockedHit(const char* source, const char* name);
+
 bool IsBlockedProcessNameA(const char* exeName)
 {
 	for (size_t i = 0; i < _countof(kBlockedProcessSubstrings); ++i)
 		if (ContainsInsensitive(exeName, kBlockedProcessSubstrings[i]))
+		{
+			LogBlockedHit("proc", exeName);
 			return true;
+		}
 	return false;
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostic: record WHO looks for a blocked tool
+// ---------------------------------------------------------------------------
+// The blocklist match is rare, so logging only on a hit is cheap. The stack
+// backtrace tells us which module is doing the looking, which is how we find
+// out which detector is responsible for the Cheat Engine kill.
+void LogBlockedHit(const char* source, const char* name)
+{
+	void* frames[8] = { 0 };
+	USHORT count = CaptureStackBackTrace(2, 8, frames, NULL);
+
+	char who[4][MAX_PATH];
+	for (int i = 0; i < 4; ++i)
+	{
+		who[i][0] = '\0';
+		if (i >= (int)count || !frames[i]) continue;
+
+		HMODULE mod = NULL;
+		if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+			GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			(LPCSTR)frames[i], &mod) && mod)
+		{
+			char path[MAX_PATH] = { 0 };
+			GetModuleFileNameA(mod, path, sizeof(path));
+			const char* base = strrchr(path, '\\');
+			_snprintf_s(who[i], sizeof(who[i]), _TRUNCATE, "%s+0x%X",
+				base ? base + 1 : path,
+				(unsigned)((BYTE*)frames[i] - (BYTE*)mod));
+		}
+		else
+		{
+			_snprintf_s(who[i], sizeof(who[i]), _TRUNCATE, "0x%p", frames[i]);
+		}
+	}
+
+	HookLog("[AntiDetect] BLOCKED-HIT src=%s name='%s' <- %s <- %s <- %s <- %s",
+		source, name, who[0], who[1], who[2], who[3]);
 }
 
 // kernel32 exports the unsuffixed "Process32First"/"Process32Next" as the ANSI
@@ -129,7 +175,10 @@ bool IsBlockedWindowString(const char* text)
 	if (!text) return false;
 	for (size_t i = 0; i < _countof(kBlockedWindowSubstrings); ++i)
 		if (ContainsInsensitive(text, kBlockedWindowSubstrings[i]))
+		{
+			LogBlockedHit("window", text);
 			return true;
+		}
 	return false;
 }
 
