@@ -589,16 +589,19 @@ BOOL WINAPI HookedTerminateProcess(HANDLE process, UINT exitCode)
 // ---------------------------------------------------------------------------
 // Hook installation helper
 // ---------------------------------------------------------------------------
+// The early pass runs inside DllMain under the loader lock, where LoadLibrary
+// can deadlock. It only hooks modules that are already mapped; InstallLate()
+// re-runs with this enabled to fill any gaps.
+bool g_allowLoadLibrary = true;
+
 void InstallHook(const char* module, const char* name, LPVOID detour, LPVOID* original)
 {
-	// Install() runs at the very top of the init thread, so a module we want may
-	// not be mapped yet (we deliberately run before the d3d9 wait). Pull it in
-	// rather than silently skipping the hook.
 	HMODULE mod = GetModuleHandleA(module);
-	if (!mod) mod = LoadLibraryA(module);
+	if (!mod && g_allowLoadLibrary)
+		mod = LoadLibraryA(module);
 	if (!mod)
 	{
-		HookLog("[AntiDetect] %s not loaded - skipping %s", module, name);
+		HookLog("[AntiDetect] %s not mapped - skipping %s", module, name);
 		return;
 	}
 	LPVOID target = (LPVOID)GetProcAddress(mod, name);
@@ -627,7 +630,9 @@ void InstallHook(const char* module, const char* name, LPVOID detour, LPVOID* or
 
 namespace AntiDetect {
 
-	void Install()
+	// Shared by Install() and InstallLate(); idempotent (InstallHook skips hooks
+	// that already exist), so the late pass only fills gaps.
+	static void InstallAllHooks()
 	{
 		ClearPebDebugFlags();
 
@@ -693,7 +698,33 @@ namespace AntiDetect {
 		InstallHook("kernel32.dll", "TerminateProcess",
 			(LPVOID)HookedTerminateProcess, (LPVOID*)&g_realTerminateProcess);
 
-		HookLog("[AntiDetect] Install() complete");
+	}
+
+	// Early pass: called from DllMain, synchronously, before any of the client's
+	// code runs. Threads created inside DllMain do not start until the loader
+	// lock is released (which happens after the entry point), and the client's
+	// anti-cheat (ndac.dll) was observed running immediately after the entry
+	// point - so installing from the init thread loses that race.
+	void Install()
+	{
+		g_allowLoadLibrary = false;   // LoadLibrary can deadlock under the loader lock
+
+		MH_STATUS initStatus = MH_Initialize();
+		if (initStatus != MH_OK && initStatus != MH_ERROR_ALREADY_INITIALIZED)
+			HookLog("[AntiDetect] MH_Initialize failed (%d)", initStatus);
+
+		InstallAllHooks();
+		HookLog("[AntiDetect] Install() (early, from DllMain) complete");
+	}
+
+	// Full pass: called from the init thread once the loader lock is gone. May
+	// LoadLibrary, and re-runs the whole set to fill anything the early pass had
+	// to skip.
+	void InstallLate()
+	{
+		g_allowLoadLibrary = true;
+		InstallAllHooks();
+		HookLog("[AntiDetect] InstallLate() complete");
 	}
 
 	void PerFrame()

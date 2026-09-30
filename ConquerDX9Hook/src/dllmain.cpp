@@ -23,14 +23,12 @@ extern HRESULT WINAPI HookedReset(LPDIRECT3DDEVICE9 device, D3DPRESENT_PARAMETER
 
 void HookInitializationThread()
 {
-	// Install the anti-detection hooks FIRST, before anything else.
-	// The client's anti-cheat runs its early checks within roughly a second of
-	// startup; waiting for d3d9.dll and then scanning its 1 MB image for the VMT
-	// pattern takes long enough that a check firing in that window would run
-	// before our hooks existed.
+	// The DllMain pass already installed everything it could. Re-run now that the
+	// loader lock is gone and LoadLibrary is safe, to fill in any module that was
+	// not mapped yet.
 	MH_STATUS sh = MH_Initialize();
 	if (sh != MH_OK && sh != MH_ERROR_ALREADY_INITIALIZED) HookLog("MH_Initialize failed %d", sh);
-	AntiDetect::Install();
+	AntiDetect::InstallLate();
 
 	HMODULE direct3D9ModuleHandle = nullptr;
 
@@ -137,6 +135,16 @@ BOOL APIENTRY DllMain(HMODULE moduleHandle, DWORD reason, LPVOID reserved)
 	case DLL_PROCESS_ATTACH:
 
 		DisableThreadLibraryCalls(moduleHandle);
+
+		// Install the anti-detection hooks HERE, synchronously, before any of the
+		// client's code runs. A thread created inside DllMain does not start
+		// until the loader lock is released - which happens after the process
+		// entry point - and the client's anti-cheat (ndac.dll) was observed
+		// running immediately after the entry point. Installing from the init
+		// thread below therefore loses that race.
+		// AntiDetect::Install() deliberately never calls LoadLibrary, so it is
+		// safe to run while the loader lock is held.
+		AntiDetect::Install();
 
 		CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)HookInitializationThread, NULL, 0, NULL);
 		break;
