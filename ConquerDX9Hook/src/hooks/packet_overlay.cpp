@@ -460,7 +460,9 @@ namespace {
 		if (!g_res.font) { ReleaseResources(); return false; }
 		g_res.oldFont = SelectObject(g_res.dc, g_res.font);
 
-		TEXTMETRIC tm;
+		// Explicit ANSI struct: the project is built with UNICODE, so a plain
+		// TEXTMETRIC is the W variant and will not match GetTextMetricsA.
+		TEXTMETRICA tm;
 		if (GetTextMetricsA(g_res.dc, &tm))
 		{
 			g_res.charH = tm.tmHeight;

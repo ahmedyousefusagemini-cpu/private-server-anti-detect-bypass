@@ -306,7 +306,13 @@ namespace {
 	// -----------------------------------------------------------------------
 
 	// CMyClientSocket::DoSendMsg - outgoing plaintext, pre-encryption.
-	int __thiscall HookedDoSendMsg(void* self, void* msg)
+	//
+	// The original is __thiscall: `this` in ECX, CMsg* on the stack, RET 4.
+	// MSVC will not accept __thiscall on a free function (C3865), so the hook
+	// is declared __fastcall instead - ECX = self, EDX = unused, and the real
+	// argument still arrives on the stack. That is the same ABI, so the
+	// trampoline can jump straight into it.
+	int __fastcall HookedDoSendMsg(void* self, void* /*unusedEdx*/, void* msg)
 	{
 		if (msg)
 		{
