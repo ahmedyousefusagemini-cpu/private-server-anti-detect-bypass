@@ -117,24 +117,32 @@ flagged. Labels are kept **per message id**, because `0x0833` and `0x0898`
 number their fields differently and one shared table would mislabel both. See
 [docs/action-protobuf-fields.md](docs/action-protobuf-fields.md).
 
-### Jump to a cell
+### Move to a cell
 
-The builder's **Jump to cell** row moves the character to a chosen `x, y`. It
-sends a `0x0898` `CMsgWalk` whose field 4 is the target cell:
+The builder's **Move to cell** row moves the character to a chosen `x, y` by
+sending a `0x0833` `CMsgAction`. A move carries **both ends** of the step:
 
 ```
-f4 = (y << 16) | (x << 8) | frac
+f7  = target X     f8  = target Y
+f14 = origin X     f15 = origin Y
+f12 = action mode  (137 = 0x89 is the move mode)
 ```
 
-`x` and `y` were confirmed against eleven real captures on straight walks
-(three moved `x` 53 → 59 → 171 with `y` pinned; eight moved `x` 163 → 169 with
-`y` pinned), and the packed value advances by a near-constant ~198 counts per
-packet — so the field is a fixed-point position and the low byte is a
-fractional part, not padding. A jump zeroes that fraction so the character
-lands exactly on the tile. Everything else is copied from a real capture, and
-`f4` is rewritten through the varint re-encoder because its length changes.
+The field numbers come from the client's own sender, `FUN_00d94ff5`, which
+stamps `id = 0x833` and stores its arguments at fixed object offsets; sorting
+those offsets lines them up with the protobuf fields, and two of the anchors
+(the clock at `+0x450`, the mode at `+0x45C`) were already established
+independently. The capture then confirms the pairs directly: **f14/f15 of one
+packet equal f7/f8 of the previous packet in 12 of 13 consecutive moves** —
+the signature of a "from → to" action.
 
-Full derivation, the capture tables, and what is still open:
+Writing only the target would leave the origin describing wherever the
+capture was taken, so the panel stamps the origin too. **Start with a few
+tiles**: whether the server accepts a step longer than the normal walk range
+is untested. If a move lands mirrored, swap the `Xf`/`Yf` field numbers in
+the panel — no rebuild needed.
+
+Full derivation, the capture tables, and what is still inferred:
 [docs/walk-position-fields.md](docs/walk-position-fields.md).
 
 ### Controls
@@ -235,7 +243,7 @@ docs/packet-hooks.md         Ghidra derivation of the two hook addresses
 docs/packet-catalog.md       every message id, its name and its meaning
 docs/packet-send.md          how a packet is built and sent (and why replay)
 docs/action-protobuf-fields.md  what each CMsgAction (0x0833) field is, and how to identify the rest
-docs/walk-position-fields.md    where the 0x0898 walk target cell lives, and its packing
+docs/walk-position-fields.md    where the move target lives (0x0833 f7/f8), and how it was pinned down
 docs/overlay-imgui.md        how ImGui is wired into the hook / reset path
 ```
 

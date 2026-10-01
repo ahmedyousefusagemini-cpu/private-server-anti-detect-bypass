@@ -33,18 +33,32 @@ it took four values:
 than 20 minutes of capture. A coordinate would not sit on one large value and
 toggle by 604 — that is a *thing*, not a *place*.
 
-**Fields 7, 14, 8, 15 are not a coordinate pair.** They float in two narrow
-bands:
+**Fields 7, 8, 14 and 15 ARE the position — this was initially missed.**
+They were first dismissed because they float in two narrow bands:
 
 ```
 f7  / f14 :  376 .. 381     (5 wide)
 f8  / f15 :  210 .. 231     (21 wide)
 ```
 
-A coordinate that addresses a map spans hundreds of values. These move within
-a couple of dozen, and there is no consistent relation *within* a message
-(`f7 == f14` in some packets, false in others; same for `f8 == f15`). They are
-sub-tile phases or animation frame indices — small, bounded, per-frame state.
+The error was reading those ranges as "too small to be coordinates". In fact
+the character simply was not moving during that capture. Across 13
+consecutive packets, **f14/f15 of one packet equal f7/f8 of the previous
+packet in 12 cases** — the signature of a movement action carrying a "from"
+pair and a "to" pair:
+
+| field | meaning |
+|---|---|
+| **f7 / f8** | **target X / Y** |
+| **f14 / f15** | **origin X / Y** |
+
+This was then confirmed independently from the client's own sender,
+`FUN_00d94ff5`, whose argument-to-offset stores line up with the protobuf
+fields once sorted (see
+[walk-position-fields.md](walk-position-fields.md) for the full table).
+
+An earlier revision of this document labelled f7/f14 and f8/f15 as "phase
+counters". That was wrong and has been corrected in the code as well.
 
 ## The four body shapes
 
@@ -64,15 +78,23 @@ whatever is there and shows an unparsed tail if the walk stops early.
 
 ## Conclusion
 
-**`CMsgAction` carries no position.** It is an animation/action message: a
-clock, a session reference, a sub-type selector, an entity id and some small
-per-frame counters. No field in it addresses a map cell.
+**`CMsgAction` carries the move target.** A move is `0x0833` with:
 
-The position lives in **`0x0898 CMsgWalk`**, field 4 — see
-[walk-position-fields.md](walk-position-fields.md). The jump-to-X,Y feature
-uses that message, not this one.
-  `0x0988 CMsgMapItem` was observed with `f4=448, f5=270` — a plausible `(x,y)`
-  shape, in a different message.
+* `f7` / `f8` — the destination X / Y
+* `f14` / `f15` — the origin X / Y
+* `f12` — the action mode, where **137 (`0x89`) is the move mode**
+* `f1` — the character id, `f9` — the client clock
+
+The move-to-X,Y feature drives this message. See
+[walk-position-fields.md](walk-position-fields.md) for how the field numbers
+were pinned down and what is still inferred.
+
+`0x0898 CMsgWalk` field 4 also carries a position, packed as
+`(y<<16)|(x<<8)|frac`, and that finding stands — it is simply not the message
+to send to make the character move.
+
+`0x0988 CMsgMapItem` was observed with `f4=448, f5=270` — a plausible `(x,y)`
+shape, in a different message.
 
 ## How to settle it — the built-in diff
 

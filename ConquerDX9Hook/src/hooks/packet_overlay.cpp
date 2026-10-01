@@ -199,38 +199,51 @@ namespace {
 	float  g_jumpNextTime = 0.0f;
 	bool   g_jumpAutoFire = false;
 
-	// Jump-to-X,Y. This works on 0x0898 (CMsgWalk), not 0x0833. Field 4 of
-	// the SEND carries the target cell as a fixed-point position:
+	// Jump-to-X,Y.
 	//
-	//     f4 = (y << 16) | (x << 8) | frac
+	// The move target lives in 0x0833 CMsgAction, NOT in 0x0898. This was
+	// proved by decompiling the client's own sender, FUN_00d94ff5, which
+	// stamps *(u16*)(this+6) = 0x833 and stores its arguments at fixed
+	// object offsets. Sorting those offsets ascending lines them up with
+	// the protobuf fields, and two of the alignments were already known
+	// independently (the clock and the sub-type), which pins the rest:
 	//
-	//   x    = (f4 >>  8) & 0xFF   the x tile
-	//   y    = (f4 >> 16) & 0xFF   the y tile
-	//   frac =  f4        & 0xFF   fractional x within the tile (0..255)
+	//   offset   param        field   meaning
+	//   +0x42C   arg2  -> f1    character id (1353102 in every capture)
+	//   +0x448   arg7  -> f7    target X
+	//   +0x44C   arg8  -> f8    target Y
+	//   +0x450   arg9  -> f9    timestamp  <-- already verified
+	//   +0x45C   arg6  -> f12   action mode <-- already verified
+	//   +0x460   arg5  -> f13
+	//   +0x464   arg3  -> f14   origin X
+	//   +0x46C   arg4  -> f15   origin Y
+	//   +0x474   arg10 -> f17
+	//   +0x480   arg11 -> f20
 	//
-	// Two independent capture sets confirm it. Three packets on one straight
-	// walk moved x 53 -> 59 -> 171 with y pinned at 157. Eight more moved
-	// x 163 -> 169 with y pinned at 160, and the packed value advanced by
-	// 198,198,198,189,199,201,198 counts per packet - a near-constant
-	// sub-tile step, with the x byte ticking over whenever the fraction
-	// wrapped. That is a fixed-point coordinate, not two packed integers.
+	// The capture confirms it directly: across 13 consecutive move packets,
+	// f14/f15 of one packet equal f7/f8 of the previous packet in 12 cases.
+	// That is exactly a movement action carrying "from (f14,f15) to
+	// (f7,f8)". An earlier pass missed this because the character barely
+	// moved during that capture, so the values looked like a narrow band
+	// rather than coordinates.
 	//
-	// A jump targets a whole tile, so frac is written as 0 (i.e. exactly on
-	// the tile). The other fields are copied verbatim from the capture: f2
-	// is a constant per-character reference (1353102 in every sample), f3=1
-	// and f5=10364 never moved. Only f1 (direction / animation id) and f4
-	// change as the character walks.
+	// So a jump is: take a real 0x0833 capture, write the target into f7/f8,
+	// write the current position into f14/f15, and send. Every other field
+	// stays as captured.
 	//
-	// Per the packet-editing trap, a rewritten packet must stay internally
+	// Per the packet-editing trap, the rewritten packet must stay internally
 	// consistent: the id in body[0..1] must still match g_buildArmedId, and
-	// the length is recomputed by the send path. f4 is a varint whose
-	// byte-length changes with x/y, so it goes through ReplaceVarint() and
-	// is never patched in place.
-	uint16_t g_walkMsgId = 0x0898;                 // CMsgWalk - the message carrying the cell
-	int    g_walkPosField = 4;                     // protobuf field holding (y<<16)|(x<<8)|sub
-	int    g_walkX = 0;                            // target cell, 0..255
+	// the length is recomputed by the send path. Each field is a varint whose
+	// byte-length can change, so all of them go through ReplaceVarint() and
+	// are never patched in place.
+	uint16_t g_walkMsgId = 0x0833;                 // CMsgAction - carries the move target
+	int    g_walkPosFieldX = 7;                    // f7 = target X
+	int    g_walkPosFieldY = 8;                    // f8 = target Y
+	int    g_walkOriginFieldX = 14;                // f14 = origin X
+	int    g_walkOriginFieldY = 15;                // f15 = origin Y
+	int    g_walkX = 0;                            // target, in map cells
 	int    g_walkY = 0;
-	bool   g_walkSendFacing = true;                // also refresh field 1 from the live capture
+	bool   g_walkStampOrigin = true;               // also rewrite f14/f15 from the capture
 
 	// Where the jump lands is decided here, so the builder tab can show it.
 	bool     g_walkHasGoal = false;
@@ -771,116 +784,122 @@ namespace {
 	}
 
 	// -----------------------------------------------------------------------
-	// Walk cell packing (jump to x,y)
+	// Field editing (jump to x,y)
 	// -----------------------------------------------------------------------
 
-	// Packs a target cell the way 0x0898 field 4 carries it. The field is a
-	// fixed-point position: bits 8..15 are the x tile, bits 16..23 the y
-	// tile, and bits 0..7 the fractional part of x within its tile (it wraps
-	// into the x byte). Verified against eight consecutive straight-line
-	// walk captures - see docs/walk-position-fields.md.
-	uint32_t PackWalkCell(int x, int y, int sub)
-	{
-		return ((uint32_t)(y & 0xFF) << 16)
-			| ((uint32_t)(x & 0xFF) << 8)
-			| (uint32_t)(sub & 0xFF);
-	}
-
-	int UnpackWalkX(uint32_t cell) { return (int)((cell >> 8) & 0xFF); }
-	int UnpackWalkY(uint32_t cell) { return (int)((cell >> 16) & 0xFF); }
-	int UnpackWalkSub(uint32_t cell) { return (int)(cell & 0xFF); }
-
 	// Defined below, beside the rest of the builder. Declared here because
-	// BuildJumpGoal() reloads the template before stamping the cell.
+	// BuildJumpGoal() reloads the template before stamping the target.
 	bool LoadBuilderTemplate(uint16_t messageId, bool keepEdits);
 
-	// Rewrites the loaded body so the walk target is (x, y). The body must be
-	// the 0x0898 template: every other field is left exactly as captured so
-	// the packet stays a valid CMsgWalk for this client build.
+	// Sets one varint field of the loaded body to `value`, resizing the body
+	// when the new varint is a different width. Returns the new body length,
+	// or -1 when the field is absent or the result would not fit.
 	//
-	// Returns true when the cell field was found and rewritten. The caller
-	// has already checked the id, so this only has to locate the field.
-	bool ApplyWalkTarget(uint8_t* body, int& bodyBytes, int posField, int x, int y)
+	// Absent is a hard failure on purpose: 0x0833 omits fields it does not
+	// set, and silently inventing one would change the message shape the
+	// server sees.
+	int SetFieldValue(uint8_t* body, int bodyBytes, int fieldNumber, uint64_t value)
 	{
-		if (!body || bodyBytes <= 2) return false;
-		if (posField <= 0) return false;
+		if (!body || bodyBytes <= 2 || fieldNumber <= 0) return -1;
 
 		int offset = 2;                       // body[0..1] is the message id
-		const int end = bodyBytes;
-
-		while (offset < end)
+		while (offset < bodyBytes)
 		{
 			ProtoField field;
-			if (!ReadProtoField(body, end, offset, field)) return false;
+			if (!ReadProtoField(body, bodyBytes, offset, field)) return -1;
 
-			if (field.fieldNumber == posField)
+			if (field.fieldNumber == fieldNumber)
 			{
-				// The field is a fixed-point cell: y is bits 16..23, x is bits
-				// 8..15, and bits 0..7 are the sub-tile fraction (x*256 +
-				// sub = the true sub-tile coordinate). Eight consecutive walk
-				// captures advanced that fraction by a near-constant ~198
-				// counts per packet while the x byte ticked over whenever it
-				// wrapped - so the fraction is real position, not padding.
-				//
-				// A jump targets a whole tile, so the fraction is zeroed:
-				// cell = (y << 16) | (x << 8) | 0. Carrying the capture's
-				// fraction over would aim *between* tiles.
-				const uint32_t cell = PackWalkCell(x, y, 0);
+				if (field.value == value) return bodyBytes;   // nothing to do
 
 				const int newLength = ReplaceVarint(body, bodyBytes,
-					field.valueOffset, (uint64_t)cell, PacketSend::kMaxBodyBytes);
-				if (newLength == bodyBytes && cell != field.value)
-					return false;             // could not fit - refuse rather than corrupt
-
-				bodyBytes = newLength;
-				return true;
+					field.valueOffset, value, PacketSend::kMaxBodyBytes);
+				if (newLength == bodyBytes) return -1;        // could not fit
+				return newLength;
 			}
 			offset = field.nextOffset;
 		}
-		return false;
+		return -1;                            // field not present
 	}
 
-	// Reads the cell currently in the loaded body, so the UI can seed its
-	// x/y boxes from a real capture instead of making the operator guess.
-	bool ReadWalkTarget(const uint8_t* body, int bodyBytes, int posField, int& x, int& y)
+	// Reads one varint field, or false when it is not present.
+	bool GetFieldValue(const uint8_t* body, int bodyBytes, int fieldNumber, uint64_t& out)
 	{
-		if (!body || bodyBytes <= 2 || posField <= 0) return false;
+		if (!body || bodyBytes <= 2 || fieldNumber <= 0) return false;
 
 		int offset = 2;
 		while (offset < bodyBytes)
 		{
 			ProtoField field;
 			if (!ReadProtoField(body, bodyBytes, offset, field)) return false;
-			if (field.fieldNumber == posField)
-			{
-				const uint32_t cell = (uint32_t)(field.value & 0xFFFFFFFFull);
-				x = UnpackWalkX(cell);
-				y = UnpackWalkY(cell);
-				return true;
-			}
+			if (field.fieldNumber == fieldNumber) { out = field.value; return true; }
 			offset = field.nextOffset;
 		}
 		return false;
 	}
 
-	// Builds the jump body: loads the 0x0898 template, stamps the target cell,
-	// and stores the result in the goal buffer. Returns true on success.
+	// Reads the move target (f7/f8) out of a body, so the UI can seed its
+	// boxes from a real capture instead of making the operator guess.
+	bool ReadMoveTarget(const uint8_t* body, int bodyBytes,
+		int fieldX, int fieldY, int& x, int& y)
+	{
+		uint64_t vx = 0, vy = 0;
+		if (!GetFieldValue(body, bodyBytes, fieldX, vx)) return false;
+		if (!GetFieldValue(body, bodyBytes, fieldY, vy)) return false;
+		x = (int)vx;
+		y = (int)vy;
+		return true;
+	}
+
+	// Builds the jump body: loads the 0x0833 template, writes the destination
+	// into f7/f8 and a matching origin into f14/f15, and stores the result.
+	//
+	// A 0x0833 move carries BOTH ends: f14/f15 is where the move started and
+	// f7/f8 is where it ends. Writing only the target would leave the origin
+	// describing wherever the capture was taken, so the pair would claim a
+	// step the server can see never happened. The capture's own f7/f8 is the
+	// last known position, so it becomes the origin.
 	bool BuildJumpGoal(int x, int y)
 	{
-		// Always reload from the capture: a previous jump left its own x/y in
-		// the body, and stacking a new cell on top of that would compound.
+		// Always reload from the capture: a previous jump left its own target
+		// in the body, and stacking a new one on top of that would compound.
 		if (!LoadBuilderTemplate(g_walkMsgId, false)) return false;
 
-		if (!ApplyWalkTarget(g_buildBody, g_buildBodyBytes, g_walkPosField, x, y))
-			return false;
+		// Read the "here" estimate BEFORE overwriting the target.
+		int curX = 0, curY = 0;
+		const bool haveCur = ReadMoveTarget(g_buildBody, g_buildBodyBytes,
+			g_walkPosFieldX, g_walkPosFieldY, curX, curY);
+
+		// Destination first, then origin - each write can change the body
+		// length, so every call takes the current cursor.
+		int n = SetFieldValue(g_buildBody, g_buildBodyBytes, g_walkPosFieldX, (uint64_t)x);
+		if (n < 0) return false;
+		g_buildBodyBytes = n;
+
+		n = SetFieldValue(g_buildBody, g_buildBodyBytes, g_walkPosFieldY, (uint64_t)y);
+		if (n < 0) return false;
+		g_buildBodyBytes = n;
+
+		if (g_walkStampOrigin && haveCur)
+		{
+			n = SetFieldValue(g_buildBody, g_buildBodyBytes,
+				g_walkOriginFieldX, (uint64_t)curX);
+			if (n < 0) return false;
+			g_buildBodyBytes = n;
+
+			n = SetFieldValue(g_buildBody, g_buildBodyBytes,
+				g_walkOriginFieldY, (uint64_t)curY);
+			if (n < 0) return false;
+			g_buildBodyBytes = n;
+		}
 
 		// Latch the id so the send path's consistency guard is satisfied.
 		g_buildArmedId = g_walkMsgId;
 
-		const int n = g_buildBodyBytes;
-		if (n <= 0 || n > PacketSend::kMaxBodyBytes) return false;
-		memcpy(g_walkGoalBody, g_buildBody, (size_t)n);
-		g_walkGoalBytes = n;
+		const int total = g_buildBodyBytes;
+		if (total <= 0 || total > PacketSend::kMaxBodyBytes) return false;
+		memcpy(g_walkGoalBody, g_buildBody, (size_t)total);
+		g_walkGoalBytes = total;
 		g_walkGoalMsgId = g_walkMsgId;
 		g_walkHasGoal = true;
 		g_buildRawDirty = true;
@@ -2081,24 +2100,24 @@ namespace {
 	}
 
 	// Jump-to-X,Y. Sends a 0x0898 CMsgWalk whose target cell is the one the
-	// operator types, so the character moves to that tile instead of wherever
-	// the client chose. The packing is verified (x = bits 8..15, y = bits
-	// 16..23 of field 4) - see docs/walk-position-fields.md.
+	// operator types, so the character moves there instead of wherever the
+	// client chose. See docs/walk-position-fields.md for how f7/f8 and
+	// f14/f15 were identified.
 	//
-	// Everything else in the packet is copied from a real 0x0898 capture: the
-	// client's own SendSlot path still does the id/vtable/size validation, so
-	// the message has to remain a well-formed CMsgWalk or it is dropped with
-	// "Check Size Failed".
+	// Everything except those four fields is copied from a real 0x0833
+	// capture: the client's own SendSlot path still does the id/vtable/size
+	// validation, so the message has to remain a well-formed CMsgAction or it
+	// is dropped with "Check Size Failed".
 	void DrawJumpToCell()
 	{
 		ImGui::Separator();
-		ImGui::TextDisabled("Jump to cell (0x%04X)", (unsigned)g_walkMsgId);
+		ImGui::TextDisabled("Move to cell (0x%04X)", (unsigned)g_walkMsgId);
 		ImGui::Separator();
 
 		PacketSend::Slot walkSlot;
 		if (!PacketSend::GetSlot(g_walkMsgId, walkSlot))
 		{
-			Caption("No 0x0898 capture yet - walk once, then reopen this tab.");
+			Caption("No 0x0833 capture yet - move once, then reopen this tab.");
 			return;
 		}
 
@@ -2109,7 +2128,8 @@ namespace {
 		if (!seeded)
 		{
 			int x = 0, y = 0;
-			if (ReadWalkTarget(walkSlot.body, walkSlot.bodyBytes, g_walkPosField, x, y))
+			if (ReadMoveTarget(walkSlot.body, walkSlot.bodyBytes,
+				g_walkPosFieldX, g_walkPosFieldY, x, y))
 			{
 				g_walkX = x;
 				g_walkY = y;
@@ -2117,21 +2137,27 @@ namespace {
 			seeded = true;
 		}
 
+		// The map runs to roughly 0..1000, so the boxes are not clamped to a
+		// byte the way the old packed-cell version was.
 		ImGui::SetNextItemWidth(70.0f);
 		ImGui::InputInt("X##jumpcell", &g_walkX, 1, 10);
 		if (g_walkX < 0) g_walkX = 0;
-		if (g_walkX > 255) g_walkX = 255;
+		if (g_walkX > 4095) g_walkX = 4095;
 
 		ImGui::SameLine();
 		ImGui::SetNextItemWidth(70.0f);
 		ImGui::InputInt("Y##jumpcell", &g_walkY, 1, 10);
 		if (g_walkY < 0) g_walkY = 0;
-		if (g_walkY > 255) g_walkY = 255;
+		if (g_walkY > 4095) g_walkY = 4095;
 
 		ImGui::SameLine();
-		ImGui::SetNextItemWidth(60.0f);
-		ImGui::InputInt("pos field##jumpcell", &g_walkPosField, 1, 5);
-		if (g_walkPosField < 1) g_walkPosField = 1;
+		ImGui::SetNextItemWidth(55.0f);
+		ImGui::InputInt("Xf##jumpcell", &g_walkPosFieldX, 1, 5);
+		if (g_walkPosFieldX < 1) g_walkPosFieldX = 1;
+		ImGui::SameLine();
+		ImGui::SetNextItemWidth(55.0f);
+		ImGui::InputInt("Yf##jumpcell", &g_walkPosFieldY, 1, 5);
+		if (g_walkPosFieldY < 1) g_walkPosFieldY = 1;
 
 		ImGui::SameLine();
 		const bool canJump = PacketSend::CanSend(g_walkMsgId);
@@ -2160,8 +2186,8 @@ namespace {
 				g_buildFlashUntil = (float)ImGui::GetTime() + 4.0f;
 				g_buildFlashError = true;
 				_snprintf_s(g_buildFlashText, _TRUNCATE,
-					"No field %d in the 0x%04X template", g_walkPosField,
-					(unsigned)g_walkMsgId);
+					"Fields %d/%d missing in the 0x%04X template",
+					g_walkPosFieldX, g_walkPosFieldY, (unsigned)g_walkMsgId);
 			}
 		}
 		if (!canJump) ImGui::EndDisabled();
@@ -2170,18 +2196,29 @@ namespace {
 		if (ImGui::Button("Load Cell"))
 		{
 			int x = 0, y = 0;
-			if (ReadWalkTarget(g_buildBody, g_buildBodyBytes, g_walkPosField, x, y))
+			if (ReadMoveTarget(g_buildBody, g_buildBodyBytes,
+				g_walkPosFieldX, g_walkPosFieldY, x, y))
 			{
 				g_walkX = x;
 				g_walkY = y;
 			}
 		}
 
-		// Show the packed value that will go on the wire, so the encoding is
-		// visible while typing rather than hidden behind the send.
-		const uint32_t cell = PackWalkCell(g_walkX, g_walkY, 0);
-		ImGui::TextDisabled("cell = (y<<16)|(x<<8)|sub = %u  (0x%06X)",
-			cell, cell);
+		ImGui::SameLine();
+		ImGui::Checkbox("stamp origin##jumpcell", &g_walkStampOrigin);
+
+		// Read the capture's own target so the operator can see the "from"
+		// the packet will carry - if it is not where they actually are, the
+		// jump will be rejected, and pressing Load Cell refreshes it.
+		int curX = 0, curY = 0;
+		const bool haveCur = ReadMoveTarget(walkSlot.body, walkSlot.bodyBytes,
+			g_walkPosFieldX, g_walkPosFieldY, curX, curY);
+
+		if (haveCur)
+			ImGui::TextDisabled("from capture: (%d, %d)  ->  target: (%d, %d)",
+				curX, curY, g_walkX, g_walkY);
+		else
+			ImGui::TextDisabled("target: (%d, %d)", g_walkX, g_walkY);
 
 		if (g_walkHasGoal)
 		{
@@ -2208,30 +2245,36 @@ namespace {
 		bool        isClockLead;   // safe to advance by the jump-speed lead
 	};
 
-	// 0x0833 CMsgAction - entity action / animation. Verified against a
-	// 33-packet capture across all four body shapes; see
-	// docs/action-protobuf-fields.md. There is NO position field here - the
-	// walk target lives in 0x0898 instead.
+	// 0x0833 CMsgAction - entity action / movement. Field map taken from the
+	// client's own sender FUN_00d94ff5, which stamps id 0x833 and stores its
+	// arguments at fixed object offsets; sorting those offsets lines them up
+	// with the protobuf fields, and f9/f12 were already known independently.
+	// See docs/action-protobuf-fields.md.
 	//
-	//   1  constant 1353102 in every packet  (character/session reference)
-	//   9  client clock (ms), 32 distinct values, strictly increasing
-	//   12 the action sub-type (102 / 137 / 410 / 420) - selects the shape
-	//   3  an entity/object id, NOT a position: it toggles between
-	//      1442740 and 1442136 for 20+ minutes
-	//   7/14 and 8/15 float in narrow bands (376..381 and 210..231), so
-	//      they are per-frame phases, not coordinates
+	//   1  the character id (1353102 in every capture)
+	//   7  TARGET X          - one half of the destination
+	//   8  TARGET Y
+	//   9  client clock (ms) - 32 distinct values, strictly increasing
+	//   12 the action mode   - 137 (0x89) is the move/walk mode
+	//   13 direction
+	//   14 ORIGIN X          - where the move started
+	//   15 ORIGIN Y
 	//   17 fixed 10364 (2-byte tag).  20 all-ones uint64 sentinel.
+	//   3  an entity/object id, not a coordinate
+	//
+	// f14/f15 of one packet equal f7/f8 of the previous packet in 12 of 13
+	// consecutive captures, which is what identifies them as from/to.
 	const FieldNote kActionFieldNotes[] =
 	{
-		{  1, "character reference (const)", false },
+		{  1, "character id",                false },
 		{  3, "entity / object id",          false },
-		{  7, "phase counter A",             false },
-		{  8, "phase counter B",             false },
+		{  7, "TARGET X",                    false },
+		{  8, "TARGET Y",                    false },
 		{  9, "client clock (ms)",           true  },
-		{ 12, "action sub-type",             false },
-		{ 13, "counter / direction",         false },
-		{ 14, "phase counter A'",            false },
-		{ 15, "phase counter B'",            false },
+		{ 12, "action mode (137=move)",      false },
+		{ 13, "direction",                   false },
+		{ 14, "ORIGIN X",                    false },
+		{ 15, "ORIGIN Y",                    false },
 		{ 17, "constant 10364 (2-byte tag)", false },
 		{ 20, "no target (all-ones)",        false },
 	};
@@ -2365,17 +2408,24 @@ namespace {
 			// Right-hand column: the wire offset, or the change since the
 			// reference when one is set. A non-zero delta is highlighted
 			// because it is the thing the operator is hunting for.
-			if (g_buildArmedId == g_walkMsgId && field.fieldNumber == g_walkPosField
-				&& field.value <= 0xFFFFFFFFull)
+			if (g_buildArmedId == g_walkMsgId
+				&& (field.fieldNumber == g_walkPosFieldX
+					|| field.fieldNumber == g_walkPosFieldY))
 			{
-				// The cell field: show the decoded coordinates beside the raw
-				// varint so the packing is visible while editing it.
-				char cellNote[64];
-				const uint32_t cell = (uint32_t)field.value;
-				_snprintf_s(cellNote, _TRUNCATE, "x=%d y=%d frac=%d",
-					UnpackWalkX(cell), UnpackWalkY(cell), UnpackWalkSub(cell));
+				// One half of the move target. Marking it makes the pair
+				// obvious in the list, which matters because f7/f8 look like
+				// ordinary small numbers until you know what they are.
 				ImGui::SameLine();
-				ImGui::TextColored(ImVec4(0.45f, 0.75f, 0.95f, 1.0f), "%s", cellNote);
+				ImGui::TextColored(ImVec4(0.45f, 0.75f, 0.95f, 1.0f),
+					"target %s", field.fieldNumber == g_walkPosFieldX ? "X" : "Y");
+			}
+			else if (g_buildArmedId == g_walkMsgId
+				&& (field.fieldNumber == g_walkOriginFieldX
+					|| field.fieldNumber == g_walkOriginFieldY))
+			{
+				ImGui::SameLine();
+				ImGui::TextColored(ImVec4(0.60f, 0.60f, 0.60f, 1.0f),
+					"origin %s", field.fieldNumber == g_walkOriginFieldX ? "X" : "Y");
 			}
 			else if (field.value > 0xFFFFFFFFull)
 			{

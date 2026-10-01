@@ -1,128 +1,125 @@
-# Where the position lives: 0x0898 `CMsgWalk`
+# Where the move target lives: `0x0833` fields 7 and 8
 
-This is the reference for the jump-to-X,Y feature. It records how the
-position field was identified, what the packing is, and which parts are
-verified versus assumed.
+This is the reference for the move-to-X,Y feature. It records how the
+position fields were identified, what is verified, and what is still a
+reasonable inference.
 
-## Why 0x0898 and not 0x0833
+## Summary
 
-`0x0833` is `CMsgAction` - an entity action / animation message. It carries
-a client clock and an action reference, but **no position**. Several
-"one tile" captures of `0x0833` were checked and the only field that moved
-was a large id (`f3`, delta ~1,021,458 for one tile, and the same value
-reappeared ~18 minutes later) - an entity/object handle, not a coordinate.
-The fields `f7`/`f14` that looked like an axis pair moved equal-and-opposite
-with a **constant sum** (`377+378 = 381+374 = 755`), the signature of one
-scalar split across two fields.
-
-`0x0898` is `CMsgWalk`, and `docs/packet-catalog.md` documents it as:
-
-> Movement sync. SEND = client walk request (target pos); RECV =
-> authoritative position broadcast.
-
-That is the message that carries the cell.
-
-## The packing
-
-Field 4 of the SEND body holds the target cell as a **fixed-point
-position**:
+A move is a `0x0833` `CMsgAction` carrying **both ends** of the step:
 
 ```
-f4 = (y << 16) | (x << 8) | frac
-
-x    = (f4 >>  8) & 0xFF     x tile
-y    = (f4 >> 16) & 0xFF     y tile
-frac =  f4        & 0xFF     fractional x within the tile (0..255)
+f7  = target X        f8  = target Y
+f14 = origin X        f15 = origin Y
+f12 = action mode     (137 = 0x89 is the move mode)
+f1  = character id    f9  = client clock (ms)
 ```
 
-All three components fit a 256-wide Conquer map, and both axes were
-confirmed against real movement.
+To move, take a real `0x0833` capture, write the destination into f7/f8 and
+the current position into f14/f15, and send.
 
-## Evidence
+## How the field numbers were found
 
-### Set A - three packets on one straight walk
+The client's own sender is **`FUN_00d94ff5`**. It is short and explicit: it
+stamps `*(u16*)(this + 6) = 0x833` (the wire id) and stores each of its
+arguments at a fixed offset in the message object:
 
-| seq | time | f1 | f4 | x | y | frac |
-|---|---|---|---|---|---|---|
-| 010880 | 21:11.610 | 94 | 10302897 | 53 | 157 | 177 |
-| 010885 | 21:13.141 | 205 | 10304441 | 59 | 157 | 185 |
-| 011030 | 21:41.719 | 247 | 10333015 | 171 | 157 | 87 |
-
-`y` is constant at 157 while `x` moves 53 -> 59 -> 171: the walk was along
-one axis.
-
-### Set B - eight consecutive packets on one straight walk
-
-| seq | time | f1 | f4 | x | y | frac |
-|---|---|---|---|---|---|---|
-| 012245 | 24:56.438 | 122 | 10527733 | 163 | 160 | 245 |
-| 012250 | 24:56.641 | 10 | 10527931 | 164 | 160 | 187 |
-| 012260 | 24:56.829 | 154 | 10528129 | 165 | 160 | 129 |
-| 012262 | 24:57.032 | 154 | 10528327 | 166 | 160 | 71 |
-| 012267 | 24:57.219 | 154 | 10528516 | 167 | 160 | 4 |
-| 012272 | 24:57.422 | 154 | 10528715 | 167 | 160 | 203 |
-| 012276 | 24:57.625 | 154 | 10528916 | 168 | 160 | 148 |
-| 012282 | 24:57.829 | 67 | 10529114 | 169 | 160 | 90 |
-
-`y` is constant at 160, `x` advances 163 -> 169. The packed value advances
-by
-
-```
-198, 198, 198, 189, 199, 201, 198
-```
-
-- a near-constant sub-tile step. The `frac` byte descends 245 -> 187 ->
-  129 -> 71, then wraps, and the `x` byte ticks over each time it crosses.
-  **That is a fixed-point coordinate, not two integers packed side by
-  side.** The `x` byte is simply `floor(value / 256)`.
-
-Both sets agree: `x` is bits 8..15 and `y` is bits 16..23.
-
-## Fields that are constant
-
-Across every `0x0898` SEND captured, these never changed:
-
-| field | value | note |
+| object offset | argument | protobuf field |
 |---|---|---|
-| 2 | 1353102 | the same scalar that appears as field 1 of `0x0833` - a per-character / session reference, *not* a position |
-| 3 | 1 | fixed |
-| 5 | 10364 | fixed |
+| `+0x42C` | arg2 | f1 |
+| `+0x448` | arg7 | f7 |
+| `+0x44C` | arg8 | f8 |
+| `+0x450` | arg9 | **f9** |
+| `+0x45C` | arg6 | **f12** |
+| `+0x460` | arg5 | f13 |
+| `+0x464` | arg3 | f14 |
+| `+0x46C` | arg4 | f15 |
+| `+0x474` | arg10 | f17 |
+| `+0x480` | arg11 | f20 |
 
-They are copied verbatim from the template capture.
+Sorting the offsets ascending lines them up with the fields ascending. Two
+of those alignments were **already established independently** before this
+decompilation:
 
-Field 1 varies (94, 205, 247, 122, 10, 154, 67 in the samples above). It is
-a direction / animation id, not a coordinate.
+* `+0x450` is the timestamp — the value that tracks the wall clock to
+  within 3 ms across a 27-minute gap.
+* `+0x45C` is the mode — `CMsgAction::Process` switches on exactly this
+  offset, and the captured mode values (102 / 137 / 410 / 420) are what vary
+  between message shapes.
 
-## What the jump does
+Because two anchors agree, the rest of the alignment is trustworthy.
 
-To jump to a whole tile, the fixed-point fraction is zeroed:
+The sender also special-cases `arg6 == 0x89` (137), which matches the mode
+seen in every movement capture. That ties the sender to the move path.
 
-```
-f4 = (y << 16) | (x << 8) | 0
-```
+## How the pairs were confirmed
 
-so the character lands exactly on the tile rather than between tiles.
-Carrying the capture's `frac` over would aim it off-centre.
+Across 13 consecutive movement packets, **f14/f15 of one packet equal
+f7/f8 of the previous packet in 12 cases**:
 
-The rest of the packet - the id in `body[0..1]`, fields 1, 2, 3 and 5 - is
-taken from a real `0x0898` capture. The client's own `DoSendMsg` still
-does the id/vtable/size validation (`CALL [vtable+8]` compared against the
-`u16` length at `msg+4`), so the message has to remain a well-formed
-`CMsgWalk` for this build or it is dropped with `Check Size Failed`.
+| seq | f7 | f8 | f14 | f15 | f14 == prev f7 | f15 == prev f8 |
+|---|---|---|---|---|---|---|
+| 013588 | 377 | 218 | 381 | 210 | – | – |
+| 013620 | 377 | 220 | 377 | 218 | yes | yes |
+| 013622 | 377 | 222 | 377 | 220 | yes | yes |
+| 013631 | 377 | 224 | 377 | 222 | yes | yes |
+| 013635 | 377 | 226 | 377 | 224 | yes | yes |
+| 013641 | 377 | 228 | 377 | 226 | yes | yes |
+| 013645 | 377 | 229 | 377 | 228 | yes | yes |
+| 013647 | 377 | 231 | 377 | 229 | yes | yes |
+| 014458 | 377 | 224 | 377 | 231 | yes | yes |
+| 014466 | 381 | 226 | 377 | 224 | yes | yes |
+| 014480 | 379 | 220 | 381 | 226 | yes | yes |
+| 014486 | 376 | 220 | 379 | 220 | yes | yes |
+| 014515 | 381 | 220 | 377 | 222 | no | no |
+| 014528 | 377 | 214 | 381 | 220 | yes | yes |
 
-Because `f4` is a varint whose byte-length depends on x/y, it is rewritten
-through `ReplaceVarint()` and never patched in place.
+A message whose "from" half equals the previous message's "to" half is a
+movement action. That is what these two pairs are.
 
-## Still open
+## A correction
 
-- The **`frac` unit per tile** is not exactly known: the observed step was
-  ~198 counts per packet, not 256. That is consistent with a fixed-point
-  value that the client advances by a per-frame amount rather than exactly
-  one tile per packet - the walk animation does not have to land on a
-  boundary. A jump sets `frac = 0`, which sidesteps the question.
-- Whether the server **clamps or rejects** a jump distance that exceeds the
-  normal walk range has not been tested. Start with short jumps (a few
-  tiles) before trying long ones.
-- The `0x0898` **RECV** shape (`f4 = 140894148`) is the server's
-  authoritative broadcast. It uses the same field but was not needed for
-  the sender.
+An earlier pass concluded that `0x0833` carried **no** position, and that
+the target lived only in `0x0898` `CMsgWalk` field 4 (a packed
+`(y<<16)|(x<<8)|frac` cell). That was wrong.
+
+The mistake was reasoning from value ranges alone: during the capture used
+for that pass the character barely moved, so f7 sat at 376–381 and f8 at
+210–231. Those look like small counters, and they were labelled as
+"phase counters". They are in fact coordinates — the character simply was
+not going anywhere.
+
+The `0x0898` packed-cell finding is still correct for that message; it is
+just not the message to drive a move with.
+
+## What is still inferred, not proven
+
+* **Which of f7/f8 is X and which is Y.** They are assigned X-then-Y
+  because that is the order they appear in and the convention everywhere
+  else in this codebase. If a test move lands mirrored, swap the two field
+  numbers in the panel (`Xf` / `Yf`) — no rebuild needed.
+* **Whether the server accepts a step longer than the normal walk range.**
+  Untested. The origin (f14/f15) is what the server can check against its
+  own record, so a long step may be rejected or rubber-banded. **Start with
+  a few tiles**, not across the map.
+* **The exact meaning of f13.** It varies and is labelled "direction", but
+  it was not isolated.
+
+## Why the old bot project helped
+
+`H:\tools\CoClassicBot-master` targets a *different* client — `ImConquer.exe`,
+64-bit, "Classic Conquer 2.0" — so none of its RVAs apply here. What it did
+provide is the **approach**:
+
+* It moves by sending `CMsgAction` with a jump mode and x/y, not by
+  hand-crafting a walk packet. That is what pointed at `0x0833` rather than
+  `0x0898`, and the Ghidra work then confirmed it.
+* It calls the game's own `CHero::Jump(this, x, y)` at a fixed RVA
+  (`0x22A0B0` in that build) when it wants the native behaviour.
+* After sending, it **also updates the local position**
+  (`hero->m_posMap = destination`, plus the world/screen coordinates), so
+  the client does not snap back.
+
+That last point is worth keeping in mind: a packet the server accepts but
+the client does not reflect will look exactly like "the character did not
+move".
