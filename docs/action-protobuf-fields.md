@@ -14,30 +14,63 @@ but the *set* of fields present varies by action sub-type.
 
 | field | meaning | evidence |
 |---|---|---|
-| **9** | **client clock, milliseconds** | Two jumps 27.03 min apart: field delta `1,622,069` ms vs wall-clock `1,622,072` ms. A 3 ms match. This is the field the "Lead (ms/jump)" control advances. |
-| **1** | **action reference** (stable id for the action) | Byte-identical (`1353102`) across two *different* action shapes, including a non-jump one. Constant across a whole session. |
-| **20** | **"no target" sentinel** | Always `0xFFFFFFFFFFFFFFFF` (an all-ones `uint64`), encoded as the maximum-length 10-byte varint. Present in every capture so far. |
-| 8, 12, 17 | fixed in every capture seen | `226`, `137`, `10364`. Note field 17's tag is **two bytes** (`88 01`). |
+| **9** | **client clock, milliseconds** | Two jumps 27.03 min apart: field delta `1,622,069` ms vs wall-clock `1,622,072` ms. A 3 ms match. Across a 33-packet capture it took 32 distinct values, strictly increasing. This is the field the "Lead (ms/jump)" control advances. |
+| **1** | **action reference** (stable id for the action) | Byte-identical (`1353102`) in **every** one of the 33 packets captured, across all four body shapes. Constant for the whole session, so it is a character/session reference. |
+| **12** | **the action sub-type** | Takes exactly four values in the capture: `102`, `137`, `410`, `420`. The sub-type drives which fields are present, so this is the field that selects the message shape. |
+| **20** | **"no target" sentinel** | Always `0xFFFFFFFFFFFFFFFF` (an all-ones `uint64`), encoded as the maximum-length 10-byte varint. Appears only in the 42-byte shape. |
+| **17** | fixed at `10364` | Present in the 42-byte shape only. Its tag is **two bytes** (`88 01`). |
 
-## Suspected, not confirmed
+## Ruled out as position
 
-| field | guess | why it is only a guess |
+**Field 3 is an entity/object id, not a coordinate.** In the 33-packet capture
+it took four values:
+
+```
+421282, 57456, 1442740, 1442136
+```
+
+`1442740` and `1442136` alternate (differing by 604) and recur across more
+than 20 minutes of capture. A coordinate would not sit on one large value and
+toggle by 604 — that is a *thing*, not a *place*.
+
+**Fields 7, 14, 8, 15 are not a coordinate pair.** They float in two narrow
+bands:
+
+```
+f7  / f14 :  376 .. 381     (5 wide)
+f8  / f15 :  210 .. 231     (21 wide)
+```
+
+A coordinate that addresses a map spans hundreds of values. These move within
+a couple of dozen, and there is no consistent relation *within* a message
+(`f7 == f14` in some packets, false in others; same for `f8 == f15`). They are
+sub-tile phases or animation frame indices — small, bounded, per-frame state.
+
+## The four body shapes
+
+`0x0833` appears in four distinct lengths in this capture, and the field set
+depends on the sub-type:
+
+| body bytes | fields | note |
 |---|---|---|
-| 7, 14 | a **position pair** | They move by equal and opposite amounts with a constant sum: `377+378 = 381+374 = 755`. |
+| 16 | `1, 5, 9, 12, 13` | shortest — no entity id |
+| 20 | `1, 3, 5, 9, 12, 13` | adds the entity id |
+| 25 | `1, 3, 9, 10, 12, 13, 14, 15` | `f10 = 0` |
+| 42 | `1, 7, 8, 9, 12, 13, 14, 15, 17, 20` | the "full" shape |
 
-The fixed-sum behaviour is the important detail: if `(7, 14)` were independent
-`(x, y)` coordinates, a jump would not move both by 4 in *opposite* directions
-while the total stays constant. That pattern is a single scalar split across
-two fields — e.g. `(position, total - position)` — not two axes. Editing them
-as if they were x/y would produce an internally inconsistent position.
+Because protobuf omits unset fields, the field *numbers* are stable but the
+*set* present varies. The builder's decoded view handles this — it walks
+whatever is there and shows an unparsed tail if the walk stops early.
 
-## Also unresolved
+## Conclusion
 
-* `13` changed `0 → 7` and `15` changed `216 → 217` between the two captures.
-  Small counters, or a direction index. Two samples are not enough to say.
-* `CMsgWalk` (`0x0898`) is the message that actually *walks* the character
-  somewhere. If a coordinate pair exists on the wire, it is at least as likely
-  to live there as in `CMsgAction`, which is an animation/action message.
+**`CMsgAction` carries no position.** It is an animation/action message: a
+clock, a session reference, a sub-type selector, an entity id and some small
+per-frame counters. No field in it addresses a map cell.
+
+The position lives in **`0x0898 CMsgWalk`**, field 4 — see
+[walk-position-fields.md](walk-position-fields.md). The jump-to-X,Y feature
+uses that message, not this one.
   `0x0988 CMsgMapItem` was observed with `f4=448, f5=270` — a plausible `(x,y)`
   shape, in a different message.
 

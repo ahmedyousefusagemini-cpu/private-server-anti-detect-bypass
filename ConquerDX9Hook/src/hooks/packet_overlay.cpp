@@ -2208,22 +2208,31 @@ namespace {
 		bool        isClockLead;   // safe to advance by the jump-speed lead
 	};
 
-	// 0x0833 CMsgAction - entity action / animation.
-	//   field 9 moves by the wall-clock delta between two jumps (3 ms over
-	//   27 minutes), so it is the client's millisecond clock.
-	//   field 1 is byte-identical across two different action shapes.
-	//   field 20 is an all-ones uint64 sentinel.
+	// 0x0833 CMsgAction - entity action / animation. Verified against a
+	// 33-packet capture across all four body shapes; see
+	// docs/action-protobuf-fields.md. There is NO position field here - the
+	// walk target lives in 0x0898 instead.
+	//
+	//   1  constant 1353102 in every packet  (character/session reference)
+	//   9  client clock (ms), 32 distinct values, strictly increasing
+	//   12 the action sub-type (102 / 137 / 410 / 420) - selects the shape
+	//   3  an entity/object id, NOT a position: it toggles between
+	//      1442740 and 1442136 for 20+ minutes
+	//   7/14 and 8/15 float in narrow bands (376..381 and 210..231), so
+	//      they are per-frame phases, not coordinates
+	//   17 fixed 10364 (2-byte tag).  20 all-ones uint64 sentinel.
 	const FieldNote kActionFieldNotes[] =
 	{
-		{  1, "action reference (constant)", false },
-		{  7, "position pair A",             false },
-		{  8, "fixed",                       false },
+		{  1, "character reference (const)", false },
+		{  3, "entity / object id",          false },
+		{  7, "phase counter A",             false },
+		{  8, "phase counter B",             false },
 		{  9, "client clock (ms)",           true  },
-		{ 12, "fixed",                       false },
-		{ 13, "counter",                     false },
-		{ 14, "position pair B",             false },
-		{ 15, "counter / direction",         false },
-		{ 17, "constant (2-byte tag)",       false },
+		{ 12, "action sub-type",             false },
+		{ 13, "counter / direction",         false },
+		{ 14, "phase counter A'",            false },
+		{ 15, "phase counter B'",            false },
+		{ 17, "constant 10364 (2-byte tag)", false },
 		{ 20, "no target (all-ones)",        false },
 	};
 
