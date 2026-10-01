@@ -42,12 +42,16 @@ namespace {
 	// -----------------------------------------------------------------------
 	const uintptr_t kRvaDoSendMsg = 0x00E799A1u;   // absolute 0x012799A1
 	const uintptr_t kRvaGetMsgType = 0x0090C67Bu;  // absolute 0x00D0C67B
+	const uintptr_t kRvaActionSend = 0x00994FF5u;  // absolute 0x00D94FF5
 
 	// Prologues, used to confirm the client build matches before hooking.
 	//   DoSendMsg : PUSH EBP; MOV EBP,ESP; SUB ESP,0Ch; PUSH EBX; PUSH ESI; PUSH EDI; MOV EDI,[EBP+8]
 	const uint8_t kSigDoSendMsg[] = { 0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x0C, 0x53, 0x56, 0x57, 0x8B, 0x7D, 0x08 };
 	//   GetMsgType: PUSH EBP; MOV EBP,ESP; MOV EAX,[EBP+8]; MOV AX,[EAX+2]; POP EBP; RET
 	const uint8_t kSigGetMsgType[] = { 0x55, 0x8B, 0xEC, 0x8B, 0x45, 0x08, 0x66, 0x8B, 0x40, 0x02, 0x5D, 0xC3 };
+	//   ActionSend: PUSH EBP; MOV EBP,ESP; PUSH EBX; PUSH ESI; MOV ESI,[EBP+8]; PUSH EDI; MOV EDI,ECX; TEST ESI,ESI
+	//   Stopped before the following JZ so no relative offset is baked in.
+	const uint8_t kSigActionSend[] = { 0x55, 0x8B, 0xEC, 0x53, 0x56, 0x8B, 0x75, 0x08, 0x57, 0x8B, 0xF9, 0x85, 0xF6 };
 
 	// Never read more than this from a claimed packet length.
 	const uint32_t kHardMaxLength = 2048;
@@ -56,8 +60,32 @@ namespace {
 	// only the receive-side typedef belongs here.
 	typedef uint16_t(__cdecl* GetMsgTypeFn)(const uint8_t* packet, int len);
 
+	// The client's own CMsgAction (0x0833) sender. It stamps the wire id and
+	// stores each argument into the message object, so hooking it shows
+	// exactly what the game sends for a move - the mode and the coordinate
+	// pair - which is the ground truth an injected packet has to match.
+	//
+	// All ten stack arguments are forwarded and logged rather than named
+	// individually. The decompiler's argument numbering for a __thiscall
+	// with this many stack arguments is off by one against the object
+	// stores it performs, so naming them here would assert a mapping that
+	// is not trustworthy. The interesting ones are recognisable by VALUE
+	// (mode 137, and the two small coordinates).
+	typedef int(__fastcall* ActionSendFn)(void* self, void* edx,
+		int a2, int a3, int a4, int a5, int a6,
+		int a7, int a8, int a9, int a10, int a11);
+
 	DoSendMsgFn g_realDoSendMsg = nullptr;
 	GetMsgTypeFn g_realGetMsgType = nullptr;
+	ActionSendFn g_realActionSend = nullptr;
+
+	// Last argument vector logged, so a burst of identical actions collapses
+	// to one line instead of flooding the log. A move still logs each step
+	// because its coordinates change.
+	int   g_lastActionArgs[10] = { 0 };
+	bool  g_haveLastActionArgs = false;
+	DWORD g_lastActionLogTick = 0;
+	const DWORD kActionLogRepeatMs = 1000;
 
 	// The socket the most recent outgoing send travelled on. DoSendMsg is
 	// __thiscall, so `self` is the CMyClientSocket*; PacketSend needs it to
@@ -366,6 +394,45 @@ namespace {
 		return g_realGetMsgType(packet, len);
 	}
 
+	// The client's own action sender (0x0833). Logs the argument vector so a
+	// real move can be read straight off, then passes the call through
+	// untouched - this observes, it does not change behaviour.
+	//
+	// Reading the log: the mode is the argument whose value is 137 (0x89) on
+	// a move, and the coordinate pair is the two adjacent small numbers that
+	// change as the character walks. Those two facts are enough to place
+	// every other argument relative to them.
+	int __fastcall HookedActionSend(void* self, void* /*unusedEdx*/,
+		int a2, int a3, int a4, int a5, int a6,
+		int a7, int a8, int a9, int a10, int a11)
+	{
+		const int args[10] = { a2, a3, a4, a5, a6, a7, a8, a9, a10, a11 };
+
+		bool changed = !g_haveLastActionArgs;
+		if (!changed)
+		{
+			for (int i = 0; i < 10; ++i)
+				if (args[i] != g_lastActionArgs[i]) { changed = true; break; }
+		}
+
+		// Collapse repeats so a burst of identical actions is one line, but
+		// never go silent for longer than kActionLogRepeatMs - otherwise an
+		// unchanging stream would look like the hook had stopped working.
+		const DWORD now = GetTickCount();
+		if (changed || (now - g_lastActionLogTick) >= kActionLogRepeatMs)
+		{
+			for (int i = 0; i < 10; ++i) g_lastActionArgs[i] = args[i];
+			g_haveLastActionArgs = true;
+			g_lastActionLogTick = now;
+
+			HookLog("[Action] a2=%d a3=%d a4=%d a5=%d a6=%d a7=%d a8=%d a9=%u a10=%d a11=%d",
+				a2, a3, a4, a5, a6, a7, a8, (unsigned)a9, a10, a11);
+		}
+
+		return g_realActionSend(self, nullptr,
+			a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
+	}
+
 	// -----------------------------------------------------------------------
 	// Install helpers
 	// -----------------------------------------------------------------------
@@ -436,6 +503,20 @@ void Install()
 	else
 	{
 		HookLog("[Capture] RECV signature mismatch at %p - client build differs, hook skipped", (void*)getMsgType);
+	}
+
+	// The action sender. Observational only - it logs and forwards, so a
+	// signature mismatch costs nothing but a missing log line.
+	uintptr_t actionSend = base + kRvaActionSend;
+	if (SignatureMatches(actionSend, kSigActionSend, sizeof(kSigActionSend)))
+	{
+		MH_STATUS st = MH_CreateHook((LPVOID)actionSend, (LPVOID)HookedActionSend, (LPVOID*)&g_realActionSend);
+		if (st == MH_OK) { MH_EnableHook((LPVOID)actionSend); HookLog("[Capture] ACTION hook installed"); }
+		else HookLog("[Capture] ACTION hook failed %d", st);
+	}
+	else
+	{
+		HookLog("[Capture] ACTION signature mismatch at %p - client build differs, hook skipped", (void*)actionSend);
 	}
 }
 
