@@ -243,6 +243,7 @@ namespace {
 	int    g_walkOriginFieldY = 15;                // f15 = origin Y
 	int    g_walkX = 0;                            // target, in map cells
 	int    g_walkY = 0;
+	char   g_walkTargetText[64] = "";              // typed "x,y" for the quick box
 	bool   g_walkStampOrigin = true;               // also rewrite f14/f15 from the capture
 
 	// Where the jump lands is decided here, so the builder tab can show it.
@@ -875,6 +876,48 @@ namespace {
 		if (!GetFieldValue(body, bodyBytes, fieldY, vy)) return false;
 		x = (int)vx;
 		y = (int)vy;
+		return true;
+	}
+
+	// Parses a typed coordinate pair. Accepts the separators people actually
+	// type - "430,380", "430 380", "(430, 380)", "430;380", "x=430 y=380" -
+	// by simply collecting the first two runs of digits and ignoring
+	// everything else.
+	//
+	// Returns false unless BOTH numbers are present. That matters: a typo
+	// must not silently become a move to (0,0) or to (430, 0), so a partial
+	// parse is treated as no parse at all.
+	bool ParseCellText(const char* text, int& x, int& y)
+	{
+		if (!text) return false;
+
+		int nums[2] = { 0, 0 };
+		int found = 0;
+		const char* p = text;
+
+		while (*p && found < 2)
+		{
+			if (*p >= '0' && *p <= '9')
+			{
+				int v = 0;
+				while (*p >= '0' && *p <= '9')
+				{
+					v = v * 10 + (*p - '0');
+					if (v > 100000) v = 100000;   // clamp rather than overflow
+					++p;
+				}
+				nums[found++] = v;
+			}
+			else
+			{
+				++p;
+			}
+		}
+
+		if (found < 2) return false;
+
+		x = nums[0];
+		y = nums[1];
 		return true;
 	}
 
@@ -2196,7 +2239,47 @@ namespace {
 		DrawBuilderFlash();
 	}
 
-	// Jump-to-X,Y. Sends a 0x0898 CMsgWalk whose target cell is the one the
+	// Runs one move to (g_walkX, g_walkY) and reports the outcome.
+	//
+	// Shared by the Move button and the coordinate text box so both paths
+	// behave identically - in particular both go through the same
+	// BuildJumpGoal, which is what stamps the origin as well as the target.
+	void DoMoveToTarget()
+	{
+		if (BuildJumpGoal(g_walkX, g_walkY))
+		{
+			const int result = PacketSend::SendSlot(g_walkGoalMsgId,
+				g_walkGoalBody, g_walkGoalBytes);
+
+			g_buildFlashUntil = (float)ImGui::GetTime() + 3.0f;
+			g_buildFlashError = (result != 0);
+			if (result == 0)
+				_snprintf_s(g_buildFlashText, _TRUNCATE,
+					"Moved to (%d, %d) - 0x%04X %d bytes",
+					g_walkX, g_walkY, (unsigned)g_walkGoalMsgId, g_walkGoalBytes);
+			else
+				_snprintf_s(g_buildFlashText, _TRUNCATE,
+					"Move send failed (%d) - see the log", result);
+			HookLog("[Send] move to (%d,%d) -> %s", g_walkX, g_walkY,
+				result == 0 ? "ok" : "failed");
+		}
+		else
+		{
+			// Name the fields the template DOES have - that is what tells the
+			// operator they loaded the wrong shape, and which shape to go
+			// looking for instead.
+			char have[96];
+			ListFieldNumbers(g_buildBody, g_buildBodyBytes, have, sizeof(have));
+			g_buildFlashUntil = (float)ImGui::GetTime() + 4.0f;
+			g_buildFlashError = true;
+			_snprintf_s(g_buildFlashText, _TRUNCATE,
+				"No fields %d/%d in this 0x%04X (%d bytes). Has: %s",
+				g_walkPosFieldX, g_walkPosFieldY, (unsigned)g_walkMsgId,
+				g_buildBodyBytes, have);
+		}
+	}
+
+	// Move-to-X,Y. Sends a 0x0833 CMsgAction whose target is the cell the
 	// operator types, so the character moves there instead of wherever the
 	// client chose. See docs/walk-position-fields.md for how f7/f8 and
 	// f14/f15 were identified.
@@ -2234,8 +2317,52 @@ namespace {
 			seeded = true;
 		}
 
-		// The map runs to roughly 0..1000, so the boxes are not clamped to a
-		// byte the way the old packed-cell version was.
+		// --- quick path: type the coordinates ------------------------------
+		// One box for "430,380" - also accepts "430 380", "(430,380)",
+		// "430;380" or "x=430 y=380". Enter or Go submits. It runs exactly
+		// the same move as the button beside it; it just saves reaching for
+		// two number fields.
+		ImGui::SetNextItemWidth(150.0f);
+		const bool submitted = ImGui::InputTextWithHint("##targettext", "x,y",
+			g_walkTargetText, sizeof(g_walkTargetText),
+			ImGuiInputTextFlags_EnterReturnsTrue);
+
+		const bool canJump = PacketSend::CanSend(g_walkMsgId);
+
+		ImGui::SameLine();
+		if (!canJump) ImGui::BeginDisabled();
+		const bool goPressed = ImGui::Button("Go");
+		if (!canJump) ImGui::EndDisabled();
+
+		if (submitted || goPressed)
+		{
+			int tx = 0, ty = 0;
+			if (ParseCellText(g_walkTargetText, tx, ty))
+			{
+				g_walkX = tx;
+				g_walkY = ty;
+				DoMoveToTarget();
+			}
+			else
+			{
+				// Half a coordinate pair is not a coordinate pair - say so
+				// rather than sending a move to whatever did parse.
+				g_buildFlashUntil = (float)ImGui::GetTime() + 4.0f;
+				g_buildFlashError = true;
+				_snprintf_s(g_buildFlashText, _TRUNCATE,
+					"Type two numbers, e.g. 430,380");
+			}
+		}
+
+		ImGui::SameLine();
+		if (!canJump) ImGui::BeginDisabled();
+		if (ImGui::Button("Move")) DoMoveToTarget();
+		if (!canJump) ImGui::EndDisabled();
+
+		// --- the same target as editable numbers ---------------------------
+		// The map runs to roughly 0..1000, so these are not clamped to a byte
+		// the way the old packed-cell version was.
+		ImGui::SameLine();
 		ImGui::SetNextItemWidth(70.0f);
 		ImGui::InputInt("X##jumpcell", &g_walkX, 1, 10);
 		if (g_walkX < 0) g_walkX = 0;
@@ -2255,45 +2382,6 @@ namespace {
 		ImGui::SetNextItemWidth(55.0f);
 		ImGui::InputInt("Yf##jumpcell", &g_walkPosFieldY, 1, 5);
 		if (g_walkPosFieldY < 1) g_walkPosFieldY = 1;
-
-		ImGui::SameLine();
-		const bool canJump = PacketSend::CanSend(g_walkMsgId);
-		if (!canJump) ImGui::BeginDisabled();
-		if (ImGui::Button("Jump"))
-		{
-			if (BuildJumpGoal(g_walkX, g_walkY))
-			{
-				const int result = PacketSend::SendSlot(g_walkGoalMsgId,
-					g_walkGoalBody, g_walkGoalBytes);
-
-				g_buildFlashUntil = (float)ImGui::GetTime() + 3.0f;
-				g_buildFlashError = (result != 0);
-				if (result == 0)
-					_snprintf_s(g_buildFlashText, _TRUNCATE,
-						"Jumped to (%d, %d) - 0x%04X %d bytes",
-						g_walkX, g_walkY, (unsigned)g_walkGoalMsgId, g_walkGoalBytes);
-				else
-					_snprintf_s(g_buildFlashText, _TRUNCATE,
-						"Jump send failed (%d) - see the log", result);
-				HookLog("[Send] jump to (%d,%d) -> %s", g_walkX, g_walkY,
-					result == 0 ? "ok" : "failed");
-			}
-			else
-			{
-				g_buildFlashUntil = (float)ImGui::GetTime() + 4.0f;
-				g_buildFlashError = true;
-				// Name the fields the template DOES have - that is what tells
-				// the operator they loaded the wrong shape, and which shape
-				// to go looking for instead.
-				char have[96];
-				ListFieldNumbers(g_buildBody, g_buildBodyBytes, have, sizeof(have));
-				_snprintf_s(g_buildFlashText, _TRUNCATE,
-					"No fields %d/%d in this 0x%04X (%d bytes). Has: %s",
-					g_walkPosFieldX, g_walkPosFieldY, (unsigned)g_walkMsgId,
-					g_buildBodyBytes, have);
-			}
-		}
-		if (!canJump) ImGui::EndDisabled();
 
 		ImGui::SameLine();
 		if (ImGui::Button("Load Cell"))
