@@ -18,26 +18,33 @@ client update.
 
 ## The window
 
-Drawn on top of the game from inside the `EndScene` hook. Rendering is plain
-GDI into a 32-bit DIB, uploaded to a `D3DPOOL_MANAGED` texture and drawn as a
-screen-space quad — no ImGui, no D3DX, no extra dependencies.
+An [Dear ImGui](https://github.com/ocornut/imgui) window drawn on top of the
+game from inside the `EndScene` hook, using the official `imgui_impl_dx9` and
+`imgui_impl_win32` backends (vendored under `ConquerDX9Hook/libs/imgui`). The
+DX9 backend wraps its draw calls in a `D3DSBT_ALL` state block, so the game's
+render state is restored untouched.
 
 ```
-+-- Conquer Packet Monitor -------------------- SEND 412  RECV 1180  dropped 0 --+
-| #      TIME       DIR   LEN   ID      BYTES                                    |
-| 000412 03:14.882  SEND  0x23  0x0001  23 00 01 00 0C 00 00 00 41 42 43 44 ...  |
-| 000413 03:14.905  RECV  0x1F  0x0002  1F 00 02 00 04 00 00 00 0D 0A 00 00 ...  |
-+--------------------------------------------------------------------------------+
-| #000412  SEND  len=35  id=0x0001  t=03:14.882                                  |
-| 0000  23 00 01 00 0C 00 00 00  41 42 43 44 45 46 47 48  |#.......ABCDEFGH|     |
-| 0010  49 4A 4B 4C 4D 4E 4F 50  51 52 53 00 00 00 00 00  |IJKLMNOPQRS.....|     |
-+--------------------------------------------------------------------------------+
-| showing 1024 of 1592 retained  |  wheel scrolls  |  click a row for the hex dump |
-+--------------------------------------------------------------------------------+
++-- Conquer Packet Monitor ----------------- SEND 412  RECV 1180  dropped 0 --+
+| #      TIME       DIR   LEN  ID      MESSAGE         BYTES                   |
+| 000412 03:14.882  SEND  35   0x0001  Talk            23 00 01 00 0C 00 ...   |
+| 000413 03:14.905  RECV  31   0x0002  UserInfo        1F 00 02 00 04 00 ...   |
++------------------------------------------------------------------------------+
+| #000412  SEND  len=35  id=0x0001  Talk  t=03:14.882                          |
+| 0000  23 00 01 00 0C 00 00 00  41 42 43 44 45 46 47 48  |#.......ABCDEFGH|   |
+| 0010  49 4A 4B 4C 4D 4E 4F 50  51 52 53 00 00 00 00 00  |IJKLMNOPQRS.....|   |
++------------------------------------------------------------------------------+
+| showing 1024 of 1592 retained  |  following newest  |  click a row for the dump |
++------------------------------------------------------------------------------+
 ```
 
-SEND rows are orange, RECV rows are green. The packet id column is the `uint16`
-immediately after the length header.
+SEND rows are amber, RECV rows are green. The **MESSAGE** column is the
+human-readable name recovered from the client's own dispatch table (see
+[docs/packet-catalog.md](docs/packet-catalog.md)); unknown ids fall back to
+`Unknown (0xNNNN)`. Columns are resizable by dragging their edge.
+
+See [docs/overlay-imgui.md](docs/overlay-imgui.md) for how the ImGui backends
+are wired into the game's hook and reset path.
 
 ### Controls
 
@@ -47,11 +54,14 @@ immediately after the length header.
 | `F9` | pause / resume capture |
 | `F10` | clear the list |
 | `Esc` | hide the window |
-| `[X]` in the title bar | hide the window (mouse-only fallback) |
 | mouse wheel | scroll (scrolling up detaches auto-follow) |
 | click a row | select it — hex dump appears in the bottom pane |
 | drag the title bar | move the window |
+| drag a column edge | resize that column |
 | middle click | hide the window |
+
+The panel is a normal ImGui window, so it can also be closed with its title-bar
+button and resized from any edge.
 
 The hotkeys are **polled with `GetAsyncKeyState` once per frame**, not handled
 in the window procedure. Conquer drives its keyboard through DirectInput, so
@@ -61,8 +71,9 @@ works regardless of how the client consumes input. Keys are only acted on
 while the game process owns the foreground, so the overlay will not toggle
 while you are typing in another window.
 
-The window swallows mouse input while the cursor is over it, so clicking a row
-does not also move your character.
+ImGui itself decides whether to consume mouse and keyboard input: clicking the
+panel does not also move your character, and typing in a text field does not
+reach the game.
 
 ## The log file
 
@@ -71,15 +82,20 @@ executable, so traffic can be grepped or diffed after the session:
 
 ```
 ===== session started 2026-10-01 02:14:07 =====
-[02:14:07.882] SEND len=35 id=0x0001
+[02:14:07.882] SEND len=35    id=0x0001  Talk
   0000  23 00 01 00 0C 00 00 00  41 42 43 44 45 46 47 48  |#.......ABCDEFGH|
   0010  49 4A 4B 4C 4D 4E 4F 50  51 52 53 00 00 00 00 00  |IJKLMNOPQRS.....|
-[02:14:07.905] RECV len=31 id=0x0002
+[02:14:07.905] RECV len=31    id=0x0002  UserInfo
   0000  1F 00 02 00 04 00 00 00  0D 0A 00 00 00 00 00 00  |................|
 ```
 
-The file is flushed after every packet, so a crash mid-session does not lose
-what was already captured.
+Each header line ends with the recovered message name, so the log is readable
+without the window. The file is flushed after every packet, so a crash
+mid-session does not lose what was already captured.
+
+For a much richer offline decode - protobuf field breakdowns, per-id totals, a
+full catalogue of every id seen - see [`tools/packet_log.py`](tools/packet_log.py)
+and [docs/packet-catalog.md](docs/packet-catalog.md).
 
 ## Configuration
 
@@ -108,9 +124,20 @@ ConquerDX9Hook/
       log.cpp / log.h        hook_init.log diagnostics
       directx_hooks.cpp      EndScene / Reset / WndProc hooks
       packet_capture.cpp/.h  packet hooks + ring buffer + packets.log writer
-      packet_overlay.cpp/.h  the in-game window
+      packet_names.h         generated id -> CMsg<Name> table (see tools/gen_names.py)
+      imgui_bridge.cpp/.h    Dear ImGui lifecycle + input (see docs/overlay-imgui.md)
+      packet_overlay.cpp/.h  the in-game window (ImGui)
   libs/minhook/              MinHook (built from source, not the prebuilt lib)
+  libs/imgui/                Dear ImGui v1.92.9b (core + dx9/win32 backends)
+tools/
+  packet_log.py              offline decoder for packets.log (names + protobuf)
+  gen_names.py               regenerates packet_names.h from tools/data/*.tsv
+  gen_catalog.py             regenerates docs/packet-catalog.md
+  data/ids_recv.tsv          id -> CMsg<Name> (recovered, 470 entries)
+  data/overrides.tsv         curated friendly names + descriptions
 docs/packet-hooks.md         Ghidra derivation of the two hook addresses
+docs/packet-catalog.md       every message id, its name and its meaning
+docs/overlay-imgui.md        how ImGui is wired into the hook / reset path
 ```
 
 ## Build

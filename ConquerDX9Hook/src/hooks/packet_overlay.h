@@ -3,20 +3,20 @@
 // ============================================================================
 // PacketOverlay - in-game packet viewer for Conquer.exe
 // ----------------------------------------------------------------------------
-// Draws a window on top of the game (inside the D3D9 EndScene hook) listing
-// every captured packet, with a hex/ASCII detail pane for the selected one.
+// Draws a Dear ImGui window on top of the game (inside the D3D9 EndScene hook)
+// listing every captured packet, with a hex/ASCII detail pane for the selected
+// one.
 //
-// Rendering is done with plain GDI into a 32-bit DIB, which is uploaded to a
-// D3DPOOL_MANAGED texture and drawn as a screen-space quad. No ImGui, no
-// D3DX - nothing beyond d3d9.dll, so it builds against the same toolset as
-// the rest of the proxy.
+// Rendering goes through imgui_impl_dx9 with imgui_impl_win32 as the platform
+// backend; the lifecycle and input plumbing live in imgui_bridge.cpp. The
+// vendored ImGui sources are under libs/imgui (see docs/overlay-imgui.md).
 //
 // Controls
 //   F8         show / hide the window
 //   F9         pause / resume capture
 //   F10        clear the list
 //   Esc        hide the window
-//   wheel      scroll the list (scrolling up detaches auto-follow)
+//   wheel      scroll the list
 //   click row  select a packet (detail pane at the bottom)
 //   drag title move the window
 // ============================================================================
@@ -29,9 +29,9 @@ namespace PacketOverlay {
 	// Called every frame from HookedEndScene, before the original EndScene.
 	void OnEndScene(LPDIRECT3DDEVICE9 device);
 
-	// Called from HookedReset. The overlay's resources are D3DPOOL_MANAGED so
-	// they survive a device reset; these exist so a pool change stays a
-	// one-line edit.
+	// Called from HookedReset. ImGui's DX9 backend keeps its vertex/index
+	// buffers and font texture in D3DPOOL_DEFAULT, so they must be released
+	// before the reset and rebuilt after it.
 	void OnLostDevice();
 	void OnResetDevice();
 
@@ -40,7 +40,7 @@ namespace PacketOverlay {
 	bool OnWindowMessage(HWND windowHandle, UINT message, WPARAM wParam, LPARAM lParam);
 
 	// The window the D3D9 device renders into; used to map the cursor into
-	// backbuffer coordinates.
+	// backbuffer coordinates and as ImGui's platform handle.
 	void SetRenderWindow(HWND windowHandle);
 
 	bool IsVisible();

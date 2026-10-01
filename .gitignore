@@ -121,3 +121,15 @@ desktop.ini
 
 # Local agent/workspace state (not project source)
 .workbuddy-ai/
+
+# Ad-hoc reverse-engineering scratch scripts (kept locally, not part of the tool)
+/peek.py
+/pv.py
+/pv2.py
+/pv3.py
+/pv4.py
+/pv5.py
+/pv6.py
+/sc3.py
+/scan_ndac.py
+/scan_store.py

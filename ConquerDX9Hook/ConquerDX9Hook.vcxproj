@@ -67,7 +67,7 @@
       <ConformanceMode>true</ConformanceMode>
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
-      <AdditionalIncludeDirectories>$(ProjectDir)libs\minhook\include;$(ProjectDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)libs\minhook\include;$(ProjectDir)libs\imgui;$(ProjectDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
     </ClCompile>
     <Link>
@@ -89,7 +89,7 @@
       <ConformanceMode>true</ConformanceMode>
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
-      <AdditionalIncludeDirectories>$(ProjectDir)libs\minhook\include;$(ProjectDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)libs\minhook\include;$(ProjectDir)libs\imgui;$(ProjectDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
     </ClCompile>
     <Link>
@@ -110,10 +110,20 @@
     <ClInclude Include="libs\minhook\src\hde\pstdint.h" />
     <ClInclude Include="libs\minhook\src\hde\table32.h" />
     <ClInclude Include="libs\minhook\src\hde\table64.h" />
+    <ClInclude Include="libs\imgui\imgui.h" />
+    <ClInclude Include="libs\imgui\imgui_internal.h" />
+    <ClInclude Include="libs\imgui\imconfig.h" />
+    <ClInclude Include="libs\imgui\imstb_rectpack.h" />
+    <ClInclude Include="libs\imgui\imstb_textedit.h" />
+    <ClInclude Include="libs\imgui\imstb_truetype.h" />
+    <ClInclude Include="libs\imgui\backends\imgui_impl_dx9.h" />
+    <ClInclude Include="libs\imgui\backends\imgui_impl_win32.h" />
     <ClInclude Include="src\hooks\common.h" />
     <ClInclude Include="src\hooks\log.h" />
     <ClInclude Include="src\hooks\packet_capture.h" />
+    <ClInclude Include="src\hooks\packet_names.h" />
     <ClInclude Include="src\hooks\packet_overlay.h" />
+    <ClInclude Include="src\hooks\imgui_bridge.h" />
     <ClInclude Include="version.h" />
   </ItemGroup>
   <ItemGroup>
@@ -124,6 +134,13 @@
     <ClCompile Include="src\hooks\log.cpp" />
     <ClCompile Include="src\hooks\packet_capture.cpp" />
     <ClCompile Include="src\hooks\packet_overlay.cpp" />
+    <ClCompile Include="src\hooks\imgui_bridge.cpp" />
+    <ClCompile Include="libs\imgui\imgui.cpp" />
+    <ClCompile Include="libs\imgui\imgui_draw.cpp" />
+    <ClCompile Include="libs\imgui\imgui_tables.cpp" />
+    <ClCompile Include="libs\imgui\imgui_widgets.cpp" />
+    <ClCompile Include="libs\imgui\backends\imgui_impl_dx9.cpp" />
+    <ClCompile Include="libs\imgui\backends\imgui_impl_win32.cpp" />
     <ClCompile Include="libs\minhook\src\hook.c" />
     <ClCompile Include="libs\minhook\src\trampoline.c" />
     <ClCompile Include="libs\minhook\src\buffer.c" />
