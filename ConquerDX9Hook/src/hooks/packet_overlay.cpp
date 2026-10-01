@@ -177,6 +177,15 @@ namespace {
 	char   g_buildFlashText[96] = "";
 	bool   g_buildFlashError = false;
 
+	// A "reference" snapshot of the body, kept so the decoded view can show
+	// which fields moved since it was taken. This is how an unknown field
+	// gets identified: capture a jump, mark it as the reference, jump
+	// somewhere else, and the fields that changed are the position fields.
+	bool     g_diffHasRef = false;
+	uint16_t g_diffRefId = 0;
+	uint8_t  g_diffBody[PacketSend::kMaxBodyBytes] = {};
+	int      g_diffBodyBytes = 0;
+
 	// Jump speed: the number of milliseconds of lead to add to the packet's
 	// timestamp on each successive jump. The reference implementations push
 	// the client's own timestamp forward so the server accepts a faster
@@ -1869,7 +1878,85 @@ namespace {
 			_snprintf_s(g_copyFlashText, _TRUNCATE, "Copied packet hex");
 		}
 
+		// --- field identification ------------------------------------------
+		// The coordinate fields cannot be named from a single capture. This
+		// row is the tool for finding them: snapshot the current packet as a
+		// reference, move in-game, reload, and every field that changed is
+		// flagged in the decoded view above.
+		ImGui::SameLine();
+		if (ImGui::Button("Set Reference"))
+		{
+			int n = g_buildBodyBytes;
+			if (n > PacketSend::kMaxBodyBytes) n = PacketSend::kMaxBodyBytes;
+			memcpy(g_diffBody, g_buildBody, (size_t)n);
+			g_diffBodyBytes = n;
+			g_diffRefId = g_buildArmedId;
+			g_diffHasRef = true;
+			_snprintf_s(g_buildFlashText, _TRUNCATE,
+				"Reference set (0x%04X, %d bytes) - move, then Reload Template",
+				(unsigned)g_buildArmedId, n);
+			g_buildFlashError = false;
+			g_buildFlashUntil = (float)ImGui::GetTime() + 4.0f;
+		}
+
+		ImGui::SameLine();
+		if (ImGui::Button("Clear Diff"))
+		{
+			g_diffHasRef = false;
+			g_diffBodyBytes = 0;
+			_snprintf_s(g_buildFlashText, _TRUNCATE, "Reference cleared");
+			g_buildFlashError = false;
+			g_buildFlashUntil = (float)ImGui::GetTime() + 2.0f;
+		}
+
+		ImGui::SameLine();
+		if (g_diffHasRef && g_diffRefId == g_buildArmedId)
+			Caption("changed fields shown in the list");
+		else if (g_diffHasRef)
+			Caption("reference is for a different id");
+		else
+			Caption("no reference set");
+
 		DrawBuilderFlash();
+	}
+
+	// What we currently know about each protobuf field of the action packet.
+	// These labels come from diffing real captures (see docs/packet-send.md):
+	//   - field 9 moves by exactly the wall-clock delta between two jumps
+	//     (3 ms over 27 minutes), so it is the client's millisecond clock.
+	//   - field 1 is byte-identical across two different action shapes.
+	//   - field 20 is an all-ones uint64 sentinel.
+	// A label is a hint for the operator, never a promise: an unknown field
+	// stays "field N" rather than being guessed at. The "lead" column marks
+	// the one field the auto-jump is allowed to roll forward.
+	struct FieldNote
+	{
+		int         fieldNumber;
+		const char* label;
+		bool        isClockLead;   // safe to advance by the jump-speed lead
+	};
+
+	const FieldNote kFieldNotes[] =
+	{
+		{  1, "action reference (constant)", false },
+		{  7, "position pair A",             false },
+		{  8, "fixed",                       false },
+		{  9, "client clock (ms)",           true  },
+		{ 12, "fixed",                       false },
+		{ 13, "counter",                     false },
+		{ 14, "position pair B",             false },
+		{ 15, "counter / direction",         false },
+		{ 17, "constant (2-byte tag)",       false },
+		{ 20, "no target (all-ones)",        false },
+	};
+
+	// Returns the note for a field number, or null when it is not known.
+	const FieldNote* FindFieldNote(int fieldNumber)
+	{
+		for (int i = 0; i < IM_COUNTOF(kFieldNotes); ++i)
+			if (kFieldNotes[i].fieldNumber == fieldNumber)
+				return &kFieldNotes[i];
+		return nullptr;
 	}
 
 	// The varint fields in the loaded body, as editable inputs. The walk
@@ -1877,6 +1964,11 @@ namespace {
 	// tag (a non-varint wiretype, or a malformed run). For the captured
 	// 0x0833 packet it consumes the whole body; whatever is left over is
 	// shown read-only rather than silently dropped.
+	//
+	// Each row is labelled from kFieldNotes where known, so an operator can
+	// see "client clock (ms)" instead of a bare field number. Unknown fields
+	// are shown as-is - the labels are derived from real captures, not
+	// guessed, and a wrong label is worse than no label.
 	void DrawBuilderFields()
 	{
 		ImGui::TextDisabled("Decoded fields (varint)");
@@ -1899,10 +1991,38 @@ namespace {
 			if (clamped > 0xFFFFFFFFull) clamped = 0xFFFFFFFFull;
 			int value32 = (int)clamped;
 
-			char label[64];
-			_snprintf_s(label, _TRUNCATE, "field %d (body+%d)", field.fieldNumber, field.tagOffset);
+			const FieldNote* note = FindFieldNote(field.fieldNumber);
 
-			ImGui::SetNextItemWidth(150.0f);
+			// If a reference is set for this same id, look up the same field
+			// in it so the row can show how much it moved. That delta is the
+			// signal that identifies an unknown field: on a position change,
+			// the coordinate fields are the ones that shift.
+			bool  haveDelta = false;
+			uint64_t delta = 0;
+			if (g_diffHasRef && g_diffRefId == g_buildArmedId)
+			{
+				int ro = 2;
+				while (ro < g_diffBodyBytes)
+				{
+					ProtoField rf;
+					if (!ReadProtoField(g_diffBody, g_diffBodyBytes, ro, rf)) break;
+					if (rf.fieldNumber == field.fieldNumber)
+					{
+						delta = field.value - rf.value;
+						haveDelta = true;
+						break;
+					}
+					ro = rf.nextOffset;
+				}
+			}
+
+			char label[96];
+			if (note)
+				_snprintf_s(label, _TRUNCATE, "%d  %s", field.fieldNumber, note->label);
+			else
+				_snprintf_s(label, _TRUNCATE, "%d  (unknown)", field.fieldNumber);
+
+			ImGui::SetNextItemWidth(190.0f);
 			ImGui::PushID(field.tagOffset);
 			// CharsHexadecimal makes the box read/write hex; the +/- steps
 			// are 1 and 16 so the arrows move a nibble and a byte.
@@ -1925,6 +2045,30 @@ namespace {
 				}
 			}
 			ImGui::PopID();
+
+			// Right-hand column: the wire offset, or the change since the
+			// reference when one is set. A non-zero delta is highlighted
+			// because it is the thing the operator is hunting for.
+			if (field.value > 0xFFFFFFFFull)
+			{
+				ImGui::SameLine();
+				Caption("wide (>32-bit)");
+			}
+			else if (haveDelta && delta != 0)
+			{
+				char note2[48];
+				_snprintf_s(note2, _TRUNCATE, "changed %+lld",
+					(long long)((int64_t)delta));
+				ImGui::SameLine();
+				ImGui::TextColored(ImVec4(0.85f, 0.65f, 0.20f, 1.0f), "%s", note2);
+			}
+			else
+			{
+				char off[32];
+				_snprintf_s(off, _TRUNCATE, "+%d", field.tagOffset);
+				ImGui::SameLine();
+				Caption(off);
+			}
 
 			offset = field.nextOffset;
 		}

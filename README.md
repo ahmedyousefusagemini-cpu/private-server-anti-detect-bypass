@@ -109,6 +109,13 @@ this tool made up would be a guess. Instead the send hook keeps the vtable of a
 message the client itself sent, and re-issues it. See
 [docs/packet-send.md](docs/packet-send.md) for the full derivation.
 
+The decoded-field list labels each field where its meaning is **verified**
+(e.g. field 9 is the client clock — proven to 3 ms over 27 minutes) and marks
+the rest `(unknown)`. **Set Reference** / **Clear Diff** identify the unknown
+ones: snapshot a jump, move a long way, reload, and every field that changed is
+flagged. That is the route to the coordinate fields. See
+[docs/action-protobuf-fields.md](docs/action-protobuf-fields.md).
+
 ### Controls
 
 | input | action |
@@ -206,6 +213,7 @@ tools/
 docs/packet-hooks.md         Ghidra derivation of the two hook addresses
 docs/packet-catalog.md       every message id, its name and its meaning
 docs/packet-send.md          how a packet is built and sent (and why replay)
+docs/action-protobuf-fields.md  what each CMsgAction (0x0833) field is, and how to identify the rest
 docs/overlay-imgui.md        how ImGui is wired into the hook / reset path
 ```
 
