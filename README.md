@@ -24,19 +24,39 @@ game from inside the `EndScene` hook, using the official `imgui_impl_dx9` and
 DX9 backend wraps its draw calls in a `D3DSBT_ALL` state block, so the game's
 render state is restored untouched.
 
+The window is a tabbed **bot panel** shell. Every tab shares the same frame
+(hint line, FPS readout, `Save Settings` button, tab bar); the packet logger
+lives in the **Packets** tab, which the panel opens on by default.
+
 ```
-+-- Conquer Packet Monitor ----------------- SEND 412  RECV 1180  dropped 0 --+
-| #      TIME       DIR   LEN  ID      MESSAGE         BYTES                   |
-| 000412 03:14.882  SEND  35   0x0001  Talk            23 00 01 00 0C 00 ...   |
-| 000413 03:14.905  RECV  31   0x0002  UserInfo        1F 00 02 00 04 00 ...   |
-+------------------------------------------------------------------------------+
-| #000412  SEND  len=35  id=0x0001  Talk  t=03:14.882                          |
-| 0000  23 00 01 00 0C 00 00 00  41 42 43 44 45 46 47 48  |#.......ABCDEFGH|   |
-| 0010  49 4A 4B 4C 4D 4E 4F 50  51 52 53 00 00 00 00 00  |IJKLMNOPQRS.....|   |
-+------------------------------------------------------------------------------+
++-- Manager ---------------------------------------------------------------[X]--+
+| PRESS [INSERT] to toggle overlay.                                              |
+| FPS: 128.4                                                                     |
+| [ Save Settings ]  Autosaves shortly after changes                             |
++--------------------------------------------------------------------------------+
+|  Player | Map | [ Packets ] | Misc | Plugins                                   |
++--------------------------------------------------------------------------------+
+| CAPTURING | SEND 412  RECV 1180  dropped 0        [F9] pause  [F10] clear      |
+| #      TIME       DIR   LEN  ID      MESSAGE         BYTES                     |
+| 000412 03:14.882  SEND  35   0x0001  Talk            23 00 01 00 0C 00 ...     |
+| 000413 03:14.905  RECV  31   0x0002  UserInfo        1F 00 02 00 04 00 ...     |
++--------------------------------------------------------------------------------+
+| #000412  SEND  len=35  id=0x0001  Talk  t=03:14.882                            |
+| protobuf body follows the 4-byte header (len, id):                             |
+| 0000  23 00 01 00 0C 00 00 00  41 42 43 44 45 46 47 48  |#.......ABCDEFGH|     |
+| 0010  49 4A 4B 4C 4D 4E 4F 50  51 52 53 00 00 00 00 00  |IJKLMNOPQRS.....|     |
++--------------------------------------------------------------------------------+
 | showing 1024 of 1592 retained  |  following newest  |  click a row for the dump |
-+------------------------------------------------------------------------------+
++--------------------------------------------------------------------------------+
 ```
+
+| Tab | State |
+|-----|-------|
+| `Player`  | placeholder (status / inventory / skills) |
+| `Map`     | the template's Overview / Entities / Travel / Minimap layout |
+| `Packets` | **the working packet logger** |
+| `Misc`    | interface toggles + diagnostics |
+| `Plugins` | plugin list placeholder |
 
 SEND rows are amber, RECV rows are green. The **MESSAGE** column is the
 human-readable name recovered from the client's own dispatch table (see
@@ -50,15 +70,16 @@ are wired into the game's hook and reset path.
 
 | input | action |
 |---|---|
-| `F8` | show / hide the window |
+| `Insert` | show / hide the panel |
+| `F8` | show / hide the panel (alias) |
 | `F9` | pause / resume capture |
 | `F10` | clear the list |
-| `Esc` | hide the window |
+| `Esc` | hide the panel |
 | mouse wheel | scroll (scrolling up detaches auto-follow) |
-| click a row | select it — hex dump appears in the bottom pane |
-| drag the title bar | move the window |
+| click a row | select it — hex dump appears below the table |
+| drag the title bar | move the panel |
 | drag a column edge | resize that column |
-| middle click | hide the window |
+| middle click | hide the panel |
 
 The panel is a normal ImGui window, so it can also be closed with its title-bar
 button and resized from any edge.

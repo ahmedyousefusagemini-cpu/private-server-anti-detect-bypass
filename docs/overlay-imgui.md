@@ -64,13 +64,14 @@ game's render state is untouched.
 
 | Key / input   | Action |
 |---------------|--------|
-| `F8`          | show / hide the window |
+| `Insert`      | show / hide the panel |
+| `F8`          | show / hide the panel (alias) |
 | `F9`          | pause / resume capture |
 | `F10`         | clear the list |
-| `Esc`         | hide the window |
-| mouse wheel   | scroll the packet list |
+| `Esc`         | hide the panel |
+| mouse wheel   | scroll the packet list / hex dump |
 | click a row   | show that packet in the hex pane |
-| drag the title bar | move the window |
+| drag the title bar | move the panel |
 | drag a column edge | resize that column |
 
 The hotkeys are **polled** with `GetAsyncKeyState` rather than handled as
@@ -78,12 +79,49 @@ window messages: the client drives its keyboard through DirectInput, so
 `WM_KEYDOWN` is not reliably delivered to the window we subclass. Handling them
 in both places would toggle twice per press.
 
+## Panel layout
+
+The window is a tabbed "bot panel" shell. The frame is the same on every tab:
+
+```
+PRESS [INSERT] to toggle overlay.
+FPS: 128.4
+[ Save Settings ]  Autosaves shortly after changes
+──────────────────────────────────────────────────
+ Player | Map | Packets | Misc | Plugins
+──────────────────────────────────────────────────
+ <tab content>
+```
+
+The packet logger lives in the **Packets** tab (the shell opens on it by
+default). It shows a toolbar (`CAPTURING`/`PAUSED` + SEND/RECV/dropped totals),
+the live 7-column capture table (`# / TIME / DIR / LEN / ID / MESSAGE / BYTES`),
+the hex/ASCII dump of the selected packet, and a status bar.
+
+The other tabs are presentational shells for now:
+
+| Tab | State |
+|-----|-------|
+| `Player`  | placeholders for status / inventory / skills |
+| `Map`     | the template's Overview / Entities / Travel / Minimap layout |
+| `Packets` | **the working packet logger** |
+| `Misc`    | interface toggles + diagnostics |
+| `Plugins` | plugin list placeholder |
+
+Tab selection is driven by `g_requestedTab`, a one-shot "force this tab open"
+request consumed by `BeginPanelTab()`. This matters because
+`ImGuiTabItemFlags_SetSelected` is **sticky**: it queues focus toward the
+flagged tab every frame it is passed, so applying it permanently to a fixed tab
+would fight the user every time they clicked a different one. The request is
+cleared as soon as the target tab opens. `g_activeTab` records which tab's
+contents are showing, for logic that cares what the user is looking at.
+
 ## Files
 
 | File | Role |
 |------|------|
 | `src/hooks/imgui_bridge.h` / `.cpp` | ImGui lifecycle + input; the only file that touches ImGui internals |
-| `src/hooks/packet_overlay.h` / `.cpp` | the UI itself (table, hex dump, title/status bars) |
+| `src/hooks/packet_overlay.h` / `.cpp` | the UI itself (tabbed panel shell + packet table + hex dump) |
 | `src/hooks/directx_hooks.cpp` | forwards messages to `PacketOverlay::OnWindowMessage`, calls `OnEndScene`, and drives the reset path |
 | `libs/imgui/…` | vendored Dear ImGui v1.92.9b |
 

@@ -1,23 +1,25 @@
 #pragma once
 
 // ============================================================================
-// PacketOverlay - in-game packet viewer for Conquer.exe
+// PacketOverlay - in-game bot panel for Conquer.exe
 // ----------------------------------------------------------------------------
-// Draws a Dear ImGui window on top of the game (inside the D3D9 EndScene hook)
-// listing every captured packet, with a hex/ASCII detail pane for the selected
-// one.
+// Draws a Dear ImGui window on top of the game (inside the D3D9 EndScene hook).
+// The window is a tabbed bot-panel shell (Player / Map / Packets / Misc /
+// Plugins); the packet logger - the live capture table plus the hex/ASCII dump
+// of the selected packet - lives in the "Packets" tab.
 //
 // Rendering goes through imgui_impl_dx9 with imgui_impl_win32 as the platform
 // backend; the lifecycle and input plumbing live in imgui_bridge.cpp. The
 // vendored ImGui sources are under libs/imgui (see docs/overlay-imgui.md).
 //
 // Controls
-//   F8         show / hide the window
+//   Insert     show / hide the window
+//   F8         show / hide the window (alias)
 //   F9         pause / resume capture
 //   F10        clear the list
 //   Esc        hide the window
-//   wheel      scroll the list
-//   click row  select a packet (detail pane at the bottom)
+//   wheel      scroll the packet list / hex dump
+//   click row  select a packet (hex dump below the table)
 //   drag title move the window
 // ============================================================================
 
@@ -45,4 +47,8 @@ namespace PacketOverlay {
 
 	bool IsVisible();
 	void SetVisible(bool visible);
+
+	// True when the user clicked "Save Settings" since the last call; the flag
+	// is cleared on read, so the caller sees each click exactly once.
+	bool ConsumeSaveSettingsRequest();
 }

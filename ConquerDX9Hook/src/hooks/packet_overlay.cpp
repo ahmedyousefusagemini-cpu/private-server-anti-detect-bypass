@@ -1,20 +1,22 @@
 // ============================================================================
-// PacketOverlay - in-game packet viewer for Conquer.exe
+// PacketOverlay - in-game bot panel for Conquer.exe
 // ----------------------------------------------------------------------------
-// An ImGui window rendered inside the game's D3D9 EndScene. It lists every
-// captured packet (sequence, time, direction, length, id, recovered message
-// name and a hex preview) and shows a hex/ASCII dump of the selected one.
+// An ImGui window rendered inside the game's D3D9 EndScene. The window is a
+// tabbed "bot panel" shell (Player / Map / Packets / Misc / Plugins); the
+// packet logger - the live capture table plus the hex/ASCII dump of the
+// selected packet - lives in the "Packets" tab.
 //
 // Backend plumbing lives in imgui_bridge.cpp; the packet ring lives in
 // packet_capture.cpp. This file is only the UI.
 //
 // Controls
-//   F8         show / hide the window
+//   Insert     show / hide the window
+//   F8         show / hide the window (alias)
 //   F9         pause / resume capture
 //   F10        clear the list
 //   Esc        hide the window
-//   wheel      scroll the list
-//   click row  select a packet (detail pane at the bottom)
+//   wheel      scroll the packet list / hex dump
+//   click row  select a packet (hex dump below the table)
 //   drag title move the window
 // ============================================================================
 
@@ -51,15 +53,42 @@ namespace {
 	// -----------------------------------------------------------------------
 	bool  g_visible = true;
 	bool  g_visibleInitialised = false;
-	bool  g_autoScroll = true;                 // follow the newest packet
-	bool  g_positionSet = false;               // window placed on the first frame
-	ImVec2 g_initialPos = ImVec2(40.0f, 40.0f);
+	bool  g_autoScroll = true;                     // follow the newest packet
+	bool  g_positionSet = false;                   // window placed on the first frame
+	ImVec2 g_initialPos = ImVec2(240.0f, 110.0f);
 
-	HWND  g_renderWindow = nullptr;            // set by SetRenderWindow()
+	HWND  g_renderWindow = nullptr;                // set by SetRenderWindow()
 	uint32_t g_startTick = 0;
 
 	uint32_t g_selectedSeq = 0;
 	bool     g_hasSelection = false;
+
+	// Which tab's contents are currently showing (0=Player 1=Map 2=Packets
+	// 3=Misc 4=Plugins). Written by BeginPanelTab(); reserved for logic that
+	// wants to know what the user is looking at (e.g. skipping the packet
+	// table read when the Packets tab is not visible).
+	int g_activeTab = 2;
+
+	// One-shot "force this tab open" request. ImGuiTabItemFlags_SetSelected is
+	// sticky: passing it every frame on a fixed tab would fight the user's
+	// clicks (the tab bar queues focus back to it each frame). We therefore
+	// only pass it once, for the tab we want to jump to, then clear it.
+	int g_requestedTab = 2;
+
+	// Template header widgets.
+	bool g_saveSettingsPressed = false;            // latched, read by the app layer
+	float g_saveFlashUntil = 0.0f;                 // seconds; shows "Saved" briefly
+
+	// Map tab shell state (presentational only - no backend yet).
+	bool  g_mapEntities = true;
+	bool  g_mapFollow = false;
+	int   g_mapDestination = 0;
+	bool  g_speedhack = true;
+	bool  g_avoidMobs = true;
+
+	// Misc tab shell state.
+	bool  g_miscShowFps = true;
+	bool  g_miscNoLimit = false;
 
 	// Table column widths. MESSAGE and BYTES are user-resizable; the last
 	// column stretches to fill the window.
@@ -70,10 +99,12 @@ namespace {
 	float g_colId = 68.0f;
 	float g_colName = 172.0f;
 
-	const float kDetailHeight = 168.0f;
-	const float kPanelWidth = 1040.0f;
-	const float kPanelHeight = 640.0f;
+	const float kDetailHeight = 150.0f;
+	const float kPanelWidth = 1080.0f;
+	const float kPanelHeight = 660.0f;
 	const int   kBytesPerRow = 16;
+
+	const char* const kWindowTitle = "Manager";
 
 	// -----------------------------------------------------------------------
 	// Helpers
@@ -120,23 +151,189 @@ namespace {
 		out[written] = '\0';
 	}
 
-	// -----------------------------------------------------------------------
-	// Panels
-	// -----------------------------------------------------------------------
-	void DrawTitleBar(float windowWidth)
+	// Small dimmed caption used for the "Autosaves shortly after changes" note
+	// and for the placeholder text in the not-yet-implemented tabs.
+	void Caption(const char* text)
 	{
-		ImGui::TextUnformatted("Conquer Packet Monitor");
+		ImGui::TextDisabled("%s", text);
+	}
+
+	// A titled section that the template repeats all over the panel
+	// ("Overview", "Entities", "Travel", ...). Returns true while open.
+	bool BeginSection(const char* label)
+	{
+		ImGui::Spacing();
+		ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_DefaultOpen;
+		return ImGui::CollapsingHeader(label, flags);
+	}
+
+	void SectionSeparator()
+	{
+		ImGui::Spacing();
+		ImGui::Separator();
+	}
+
+	// -----------------------------------------------------------------------
+	// Template header (title-adjacent rows, above the tab bar)
+	// -----------------------------------------------------------------------
+	void DrawTemplateHeader()
+	{
+		Caption("PRESS [INSERT] to toggle overlay.");
+		ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
+
+		ImGui::Spacing();
+
+		if (ImGui::Button("Save Settings", ImVec2(120.0f, 0.0f)))
+		{
+			g_saveSettingsPressed = true;
+			g_saveFlashUntil = (float)ImGui::GetTime() + 2.0f;
+		}
+		ImGui::SameLine();
+		if (ImGui::GetTime() < g_saveFlashUntil)
+			ImGui::TextColored(ImVec4(0.45f, 0.90f, 0.55f, 1.0f), "Settings saved.");
+		else
+			Caption("Autosaves shortly after changes");
+
+		ImGui::Spacing();
+	}
+
+	// -----------------------------------------------------------------------
+	// Tab: Player  (shell)
+	// -----------------------------------------------------------------------
+	void DrawPlayerTab()
+	{
+		if (BeginSection("Status"))
+		{
+			Caption("No player bound. Log in, then reopen this panel.");
+			ImGui::Spacing();
+			ImGui::TextDisabled("HP   -- / --");
+			ImGui::TextDisabled("MP   -- / --");
+			ImGui::TextDisabled("Level  --");
+		}
+
+		SectionSeparator();
+
+		if (BeginSection("Inventory"))
+		{
+			Caption("Item grid is not wired up yet.");
+		}
+
+		SectionSeparator();
+
+		if (BeginSection("Skills"))
+		{
+			Caption("Skill list will mirror the client's learned spells.");
+		}
+	}
+
+	// -----------------------------------------------------------------------
+	// Tab: Map  (the template's default look)
+	// -----------------------------------------------------------------------
+	void DrawMapTab()
+	{
+		if (BeginSection("Overview"))
+		{
+			ImGui::Text("Map: Twin City  (ID: 1882)");
+			ImGui::Spacing();
+			ImGui::Text("Hero: (432, 376)");
+			ImGui::SameLine();
+			ImGui::TextDisabled("[Copy]");
+			ImGui::SameLine();
+			ImGui::TextDisabled("[12 gateways]");
+			ImGui::Spacing();
+			ImGui::Checkbox("Entities", &g_mapEntities);
+			ImGui::SameLine();
+			ImGui::Checkbox("Follow", &g_mapFollow);
+			ImGui::SameLine();
+			ImGui::Button("Reset View");
+			ImGui::SameLine();
+			ImGui::Button("Dump Map");
+		}
+
+		SectionSeparator();
+
+		if (BeginSection("Travel"))
+		{
+			Caption("Idle");
+			ImGui::Spacing();
+			ImGui::Text("Current Map: Twin City (1882)");
+			ImGui::Text("Hero Pos: (432, 376)");
+			ImGui::Spacing();
+			ImGui::Checkbox("Speedhack If No Players Nearby", &g_speedhack);
+			Caption("Send raw jump packets for faster travel. Falls back to normal jumps when players are nearby.");
+			ImGui::Checkbox("Avoid Mobs While Traveling", &g_avoidMobs);
+		}
+
+		SectionSeparator();
+
+		if (BeginSection("Twin City"))
+		{
+			static const char* destinations[] = { "Twin City", "Desert City", "Ape Mountain", "Phoenix Castle" };
+			ImGui::SetNextItemWidth(220.0f);
+			ImGui::Combo("Destination", &g_mapDestination, destinations, IM_COUNTOF(destinations));
+			ImGui::Button("Travel");
+			ImGui::SameLine();
+			Caption("Travel: (430, 380)");
+			ImGui::Spacing();
+			Caption("Already on Twin City.");
+		}
+
+		SectionSeparator();
+
+		if (BeginSection("Minimap"))
+		{
+			// Placeholder canvas so the template's minimap frame is visible.
+			ImVec2 available = ImGui::GetContentRegionAvail();
+			float height = available.y;
+			if (height < 140.0f) height = 140.0f;
+			if (height > 260.0f) height = 260.0f;
+
+			ImVec2 canvasSize(available.x, height);
+			ImVec2 origin = ImGui::GetCursorScreenPos();
+			ImGui::GetWindowDrawList()->AddRectFilled(
+				origin,
+				ImVec2(origin.x + canvasSize.x, origin.y + canvasSize.y),
+				IM_COL32(22, 26, 24, 255));
+			ImGui::GetWindowDrawList()->AddRect(
+				origin,
+				ImVec2(origin.x + canvasSize.x, origin.y + canvasSize.y),
+				IM_COL32(70, 78, 74, 255));
+
+			// A few dots standing in for entities.
+			ImDrawList* draw = ImGui::GetWindowDrawList();
+			const ImU32 dotColour = IM_COL32(150, 220, 160, 255);
+			const float dots[][2] = {
+				{ 0.30f, 0.42f }, { 0.33f, 0.55f }, { 0.52f, 0.30f },
+				{ 0.61f, 0.62f }, { 0.72f, 0.48f }, { 0.44f, 0.72f },
+			};
+			for (int i = 0; i < IM_COUNTOF(dots); ++i)
+			{
+				ImVec2 p(origin.x + canvasSize.x * dots[i][0],
+					origin.y + canvasSize.y * dots[i][1]);
+				draw->AddCircleFilled(p, 2.0f, dotColour);
+			}
+			ImGui::Dummy(canvasSize);
+		}
+	}
+
+	// -----------------------------------------------------------------------
+	// Tab: Packets  (the actual logger)
+	// -----------------------------------------------------------------------
+	void DrawPacketToolbar(float windowWidth)
+	{
+		// Capture state + totals on the left, capture controls on the right.
+		if (IsPaused())
+			ImGui::TextColored(ImVec4(1.0f, 0.38f, 0.38f, 1.0f), "PAUSED");
+		else
+			ImGui::TextColored(ImVec4(0.45f, 0.90f, 0.55f, 1.0f), "CAPTURING");
+
 		ImGui::SameLine();
 		ImGui::TextDisabled("| SEND %ld  RECV %ld  dropped %ld",
 			TotalSend(), TotalRecv(), TotalDropped());
 
-		if (IsPaused())
-		{
-			ImGui::SameLine();
-			ImGui::TextColored(ImVec4(1.0f, 0.38f, 0.38f, 1.0f), "| PAUSED");
-		}
-
-		const char* controls = "[F8] hide  [F9] pause  [F10] clear";
+		char controls[96];
+		_snprintf_s(controls, _TRUNCATE, "[F9] %s  [F10] clear",
+			IsPaused() ? "resume" : "pause");
 		float controlsWidth = ImGui::CalcTextSize(controls).x;
 		float x = windowWidth - controlsWidth - ImGui::GetStyle().WindowPadding.x;
 		if (x > ImGui::GetCursorPosX())
@@ -148,7 +345,7 @@ namespace {
 		ImGui::Separator();
 	}
 
-	void DrawStatusBar(const Snapshot& snapshot)
+	void DrawPacketStatusBar(const Snapshot& snapshot)
 	{
 		ImGui::Separator();
 		ImGui::TextDisabled("showing %ld of %ld retained  |  %s  |  click a row for the hex dump",
@@ -189,6 +386,8 @@ namespace {
 			ImGui::TextDisabled("(%u of %u bytes stored)",
 				(unsigned)entry->storedBytes, (unsigned)entry->length);
 		}
+
+		ImGui::TextDisabled("protobuf body follows the 4-byte header (len, id):");
 
 		// A scrollable child keeps large packets readable.
 		ImGui::BeginChild("##hexdump", ImVec2(0.0f, kDetailHeight), true,
@@ -318,6 +517,98 @@ namespace {
 		ImGui::EndTable();
 	}
 
+	void DrawPacketsTab(const Snapshot& snapshot)
+	{
+		float windowWidth = ImGui::GetWindowWidth();
+		DrawPacketToolbar(windowWidth);
+
+		// Reserve room for the status bar and the detail pane, then let the
+		// table take whatever remains.
+		float reserved = ImGui::GetTextLineHeightWithSpacing()          // status bar
+			+ kDetailHeight
+			+ ImGui::GetTextLineHeightWithSpacing()                    // "protobuf body" caption
+			+ ImGui::GetFrameHeightWithSpacing()                       // hex child border/margins
+			+ ImGui::GetStyle().ItemSpacing.y * 6.0f
+			+ ImGui::GetStyle().FramePadding.y * 2.0f;
+
+		float listHeight = ImGui::GetContentRegionAvail().y - reserved;
+		if (listHeight < 80.0f) listHeight = 80.0f;
+
+		DrawPacketTable(snapshot, listHeight);
+		DrawDetailPane(snapshot);
+		DrawPacketStatusBar(snapshot);
+	}
+
+	// -----------------------------------------------------------------------
+	// Tab: Misc  (shell)
+	// -----------------------------------------------------------------------
+	void DrawMiscTab()
+	{
+		if (BeginSection("Interface"))
+		{
+			ImGui::Checkbox("Show FPS Counter", &g_miscShowFps);
+			ImGui::Checkbox("Unlock Frame Rate", &g_miscNoLimit);
+			Caption("Frame-rate changes apply after a restart.");
+		}
+
+		SectionSeparator();
+
+		if (BeginSection("Automation"))
+		{
+			Caption("Triggers, schedules and anti-idle land here.");
+		}
+
+		SectionSeparator();
+
+		if (BeginSection("Diagnostics"))
+		{
+			ImGui::Text("ImGui %s", IMGUI_VERSION);
+			ImGui::TextDisabled("Log: %s", PacketCapture::LogFilePath());
+		}
+	}
+
+	// -----------------------------------------------------------------------
+	// Tab: Plugins  (shell)
+	// -----------------------------------------------------------------------
+	void DrawPluginsTab()
+	{
+		if (BeginSection("Loaded Plugins"))
+		{
+			Caption("No plugins loaded.");
+			ImGui::Spacing();
+			Caption("Drop a .dll next to the client and it will be listed here.");
+		}
+
+		SectionSeparator();
+
+		if (BeginSection("Marketplace"))
+		{
+			Caption("Not connected.");
+		}
+	}
+
+	// -----------------------------------------------------------------------
+	// Panel
+	// -----------------------------------------------------------------------
+	// Opens one tab. The SetSelected flag is passed only while a jump to this
+	// tab is pending, so the user's clicks are never fought over. When the tab
+	// is the visible one we record it as the current selection.
+	bool BeginPanelTab(const char* label, int index)
+	{
+		ImGuiTabItemFlags flags = ImGuiTabItemFlags_None;
+		if (g_requestedTab == index)
+			flags |= ImGuiTabItemFlags_SetSelected;
+
+		bool open = ImGui::BeginTabItem(label, nullptr, flags);
+		if (open)
+		{
+			g_activeTab = index;
+			if (g_requestedTab == index)
+				g_requestedTab = -1;   // request satisfied
+		}
+		return open;
+	}
+
 	void DrawPanel()
 	{
 		if (!g_positionSet)
@@ -331,32 +622,51 @@ namespace {
 			ImGuiWindowFlags_NoCollapse |
 			ImGuiWindowFlags_NoSavedSettings;
 
-		ImGui::SetNextWindowSizeConstraints(ImVec2(600.0f, 320.0f), ImVec2(FLT_MAX, FLT_MAX));
+		ImGui::SetNextWindowSizeConstraints(ImVec2(720.0f, 420.0f), ImVec2(FLT_MAX, FLT_MAX));
 
 		// The ring lock is taken once for the whole panel and released on every
 		// path out of Begin(), including the collapsed case where Begin()
 		// returns false and no content is drawn.
 		Snapshot snapshot = BeginRead();
 
-		if (ImGui::Begin("Conquer Packet Monitor", &g_visible, windowFlags))
+		if (ImGui::Begin(kWindowTitle, &g_visible, windowFlags))
 		{
-			float windowWidth = ImGui::GetWindowWidth();
-			DrawTitleBar(windowWidth);
+			DrawTemplateHeader();
 
-			// Reserve room for the status bar and the detail pane, then let the
-			// table take whatever remains.
-			float reserved = ImGui::GetTextLineHeightWithSpacing()          // status bar
-				+ kDetailHeight
-				+ ImGui::GetFrameHeightWithSpacing()                       // hex child border/margins
-				+ ImGui::GetStyle().ItemSpacing.y * 4.0f
-				+ ImGui::GetStyle().WindowPadding.y * 2.0f;
+			if (ImGui::BeginTabBar("##bottomtabs", ImGuiTabBarFlags_None))
+			{
+				if (BeginPanelTab("Player", 0))
+				{
+					DrawPlayerTab();
+					ImGui::EndTabItem();
+				}
 
-			float listHeight = ImGui::GetContentRegionAvail().y - reserved;
-			if (listHeight < 80.0f) listHeight = 80.0f;
+				if (BeginPanelTab("Map", 1))
+				{
+					DrawMapTab();
+					ImGui::EndTabItem();
+				}
 
-			DrawPacketTable(snapshot, listHeight);
-			DrawDetailPane(snapshot);
-			DrawStatusBar(snapshot);
+				if (BeginPanelTab("Packets", 2))
+				{
+					DrawPacketsTab(snapshot);
+					ImGui::EndTabItem();
+				}
+
+				if (BeginPanelTab("Misc", 3))
+				{
+					DrawMiscTab();
+					ImGui::EndTabItem();
+				}
+
+				if (BeginPanelTab("Plugins", 4))
+				{
+					DrawPluginsTab();
+					ImGui::EndTabItem();
+				}
+
+				ImGui::EndTabBar();
+			}
 		}
 
 		ImGui::End();
@@ -369,9 +679,9 @@ namespace {
 	// -----------------------------------------------------------------------
 	// Polled with GetAsyncKeyState instead of handled in the window procedure.
 	// Conquer drives its keyboard through DirectInput, so WM_KEYDOWN is not
-	// reliably delivered to the window we subclassed - a message-based F8
-	// handler simply never fires. Reading the physical key state works no
-	// matter how the game consumes input.
+	// reliably delivered to the window we subclassed - a message-based handler
+	// simply never fires. Reading the physical key state works no matter how
+	// the game consumes input.
 	bool IsGameForeground()
 	{
 		HWND foreground = GetForegroundWindow();
@@ -394,6 +704,7 @@ namespace {
 
 	void PollHotkeys()
 	{
+		static bool insertDown = false;
 		static bool f8Down = false;
 		static bool f9Down = false;
 		static bool f10Down = false;
@@ -402,6 +713,7 @@ namespace {
 
 		// Always sample, so the edge state stays correct even while another
 		// window has focus and we deliberately ignore the result.
+		bool insert = KeyPressedEdge(VK_INSERT, insertDown);
 		bool f8 = KeyPressedEdge(VK_F8, f8Down);
 		bool f9 = KeyPressedEdge(VK_F9, f9Down);
 		bool f10 = KeyPressedEdge(VK_F10, f10Down);
@@ -412,7 +724,7 @@ namespace {
 		// toggle while the user is typing in some other application.
 		if (!IsGameForeground()) return;
 
-		if (f8)  g_visible = !g_visible;
+		if (insert || f8) g_visible = !g_visible;
 		if (f9)  SetPaused(!IsPaused());
 		if (f10) { Clear(); g_hasSelection = false; g_autoScroll = true; }
 		if (escape && g_visible) g_visible = false;
@@ -441,6 +753,13 @@ bool IsVisible()
 void SetVisible(bool visible)
 {
 	g_visible = visible;
+}
+
+bool ConsumeSaveSettingsRequest()
+{
+	bool pressed = g_saveSettingsPressed;
+	g_saveSettingsPressed = false;
+	return pressed;
 }
 
 void OnLostDevice()
@@ -473,8 +792,8 @@ void OnEndScene(LPDIRECT3DDEVICE9 device)
 			return;
 	}
 
-	// Poll the hotkeys BEFORE the visibility check so F8 can still bring the
-	// window back once it has been hidden.
+	// Poll the hotkeys BEFORE the visibility check so INSERT can still bring
+	// the window back once it has been hidden.
 	PollHotkeys();
 
 	// ImGui needs NewFrame/Render as a pair every frame, visible or not.
