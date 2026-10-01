@@ -957,7 +957,11 @@ namespace {
 					SendBuilderOnce();
 
 				ImGui::SameLine();
-				Caption("sent %ld", PacketSend::TotalSent());
+				// Caption() is a single-argument helper, so the count is
+				// formatted first rather than passed as a format string.
+				char sentNote[48];
+				_snprintf_s(sentNote, _TRUNCATE, "sent %ld", PacketSend::TotalSent());
+				Caption(sentNote);
 			}
 
 			ImGui::Checkbox("Avoid Mobs While Traveling", &g_avoidMobs);
