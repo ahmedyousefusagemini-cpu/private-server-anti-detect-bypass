@@ -71,21 +71,67 @@ game's render state is untouched.
 | `Esc`         | hide the panel |
 | mouse wheel   | scroll the packet list / hex dump |
 | click a row   | show that packet in the hex pane |
+| drag the "drag here to move" strip | move the panel |
 | drag the title bar | move the panel |
 | drag a column edge | resize that column |
+| click a tab   | switch tabs |
 
 The hotkeys are **polled** with `GetAsyncKeyState` rather than handled as
 window messages: the client drives its keyboard through DirectInput, so
 `WM_KEYDOWN` is not reliably delivered to the window we subclass. Handling them
-in both places would toggle twice per press.
+in both places would toggle twice per press. They only fire while this process
+owns the foreground window, so the panel cannot toggle while you are typing in
+another application, and each one is edge-detected so holding a key repeats
+nothing.
+
+### Input routing (why clicking works)
+
+Three separate defects made the panel look "frozen" - visible but not
+clickable, draggable or toggleable. They are worth recording because the
+symptom is identical each time:
+
+1. **Coordinate space mismatch.** `io.MousePos` is fed in *client* coordinates
+   (`ScreenToClient`), but `io.DisplaySize` was taken from the swap chain's
+   **backbuffer** dimensions. ImGui hit-tests MousePos directly against
+   DisplaySize, so whenever the client area and the backbuffer disagreed
+   (any windowed mode, any resolution the window does not exactly match) every
+   widget's hit rectangle was shifted and clicks landed on nothing. `DisplaySize`
+   is now the client rect, falling back to the backbuffer only if the client
+   rect is unavailable. **These two must always be the same space.**
+
+2. **`WM_MOUSEMOVE` was swallowed while hovering.** The old code returned
+   `WantCaptureMouse` for `WM_MOUSEMOVE`, which stops the platform backend
+   seeing the move. The backend arms `TrackMouseEvent()` and emits
+   `WM_MOUSELEAVE` from those very messages, so its `MouseTrackedArea` latched
+   on and the window stayed permanently "hovered". Moves now always reach the
+   backend and are always passed on to the game (so camera look keeps working).
+
+3. **Two windows feeding one backend.** The subclass is installed on both the
+   root frame and the render child, but ImGui's Win32 backend keeps a single
+   `MouseHwnd` / `MouseTrackedArea` / `MouseButtonsDown` triple. Interleaving
+   messages from two HWNDs corrupts that state. Mouse messages are now accepted
+   only from the window the backend was initialised against; keyboard and focus
+   are still taken from whichever window has them, so typing in a filter box
+   works.
+
+Two smaller traps, both fixed:
+
+* `SetNextWindowPos(..., ImGuiCond_Always)` was called on the first frame only
+  - but `Always` means it would have re-pinned the window on **every** frame if
+  the guard had ever been wrong. ImGui writes a drag with `SetWindowPos()`, so
+  any unconditional `SetNextWindowPos` snaps it straight back and dragging
+  appears to do nothing. Placement now uses `ImGuiCond_FirstUseEver`, which also
+  lets the position you drag to survive the next launch.
+* The panel body is almost entirely covered by widgets, so there was no empty
+  space left to grab. The header now carries an explicit `drag here to move`
+  strip (an `InvisibleButton`, so it is a real hit target rather than a label).
 
 ## Panel layout
 
 The window is a tabbed "bot panel" shell. The frame is the same on every tab:
 
 ```
-PRESS [INSERT] to toggle overlay.
-FPS: 128.4
+PRESS [INSERT] to toggle overlay. | drag here to move  FPS: 128.4
 [ Save Settings ]  Autosaves shortly after changes
 ──────────────────────────────────────────────────
  Player | Map | Packets | Misc | Plugins

@@ -96,12 +96,15 @@ are wired into the game's hook and reset path.
 | `Esc` | hide the panel |
 | mouse wheel | scroll (scrolling up detaches auto-follow) |
 | click a row | select it — hex dump appears below the table |
+| click a tab | switch tabs |
+| drag the `drag here to move` strip | move the panel |
 | drag the title bar | move the panel |
 | drag a column edge | resize that column |
 | middle click | hide the panel |
 
-The panel is a normal ImGui window, so it can also be closed with its title-bar
-button and resized from any edge.
+The panel is a normal ImGui window, so it can also be clicked shut with its
+title-bar close button, collapsed, and resized from any edge. Where you drag it
+to is remembered on the next launch.
 
 The hotkeys are **polled with `GetAsyncKeyState` once per frame**, not handled
 in the window procedure. Conquer drives its keyboard through DirectInput, so

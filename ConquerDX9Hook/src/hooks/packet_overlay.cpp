@@ -10,14 +10,18 @@
 // packet_capture.cpp. This file is only the UI.
 //
 // Controls
-//   Insert     show / hide the window
-//   F8         show / hide the window (alias)
+//   Insert     show / hide the window  (primary toggle)
+//   F8         show / hide the window  (alias)
 //   F9         pause / resume capture
 //   F10        clear the list
 //   Esc        hide the window
 //   wheel      scroll the packet list / hex dump
 //   click row  select a packet (hex dump below the table)
-//   drag title move the window
+//   drag       move the window (title bar, or the "drag here to move" strip
+//              in the header)
+//
+// All hotkeys are polled with GetAsyncKeyState while the game process owns the
+// foreground, and only on the up->down edge so holding a key does not repeat.
 // ============================================================================
 
 #ifndef _WIN32_WINNT
@@ -55,8 +59,24 @@ namespace {
 	bool  g_visible = true;
 	bool  g_visibleInitialised = false;
 	bool  g_autoScroll = true;                     // follow the newest packet
-	bool  g_positionSet = false;                   // window placed on the first frame
+
+	// The window is placed exactly once, then owned by ImGui. Using
+	// ImGuiCond_Always here (as an earlier revision did) re-pinned the window
+	// every frame: ImGui's move logic writes the drag position with
+	// SetWindowPos(), and the next frame's unconditional SetNextWindowPos would
+	// snap it straight back - so dragging appeared to do nothing at all.
+	//
+	// A first-run default (pos + size) is what ImGuiCond_FirstUseEver is for,
+	// and it also lets the user's own placement survive a restart, because
+	// ImGui persists it to imgui.ini. We additionally seed from overlay.ini.
+	bool  g_windowPlacementPending = true;         // apply the default once
 	ImVec2 g_initialPos = ImVec2(240.0f, 110.0f);
+	ImVec2 g_initialSize = ImVec2(1080.0f, 660.0f);
+
+	// Offset between the cursor and the window origin, captured when the drag
+	// handle is first pressed, so the window does not jump on the first move.
+	ImVec2 g_dragOffset = ImVec2(0.0f, 0.0f);
+	bool   g_dragOffsetValid = false;
 
 	HWND  g_renderWindow = nullptr;                // set by SetRenderWindow()
 	uint32_t g_startTick = 0;
@@ -134,8 +154,6 @@ namespace {
 	const float kAutosaveDelay = 1.5f;         // seconds of quiet before writing
 
 	const float kDetailHeight = 150.0f;
-	const float kPanelWidth = 1080.0f;
-	const float kPanelHeight = 660.0f;
 	const int   kBytesPerRow = 16;
 
 	const char* const kWindowTitle = "Manager";
@@ -525,6 +543,54 @@ namespace {
 	void DrawTemplateHeader()
 	{
 		Caption("PRESS [INSERT] to toggle overlay.");
+		ImGui::SameLine();
+		ImGui::TextDisabled("|");
+		ImGui::SameLine();
+
+		// A dedicated drag strip. ImGui lets you move a window by its title bar
+		// or by dragging any empty background, but this panel's body is almost
+		// entirely filled with widgets, so there is often nothing left to grab.
+		// An InvisibleButton gives a real, unambiguous hit target to drag by.
+		const float dragWidth = 210.0f;
+		const float dragHeight = ImGui::GetTextLineHeight();
+		const ImVec2 dragOrigin = ImGui::GetCursorScreenPos();
+
+		ImGui::InvisibleButton("##panel_drag", ImVec2(dragWidth, dragHeight));
+		const bool dragHovered = ImGui::IsItemHovered();
+		const bool dragHeld = ImGui::IsItemActive();
+
+		if (dragHovered)
+			ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
+
+		if (dragHeld)
+		{
+			// Remember where inside the bar the user grabbed it, so the window
+			// does not snap its corner to the cursor on the first move.
+			if (!g_dragOffsetValid)
+			{
+				ImVec2 mouse = ImGui::GetIO().MousePos;
+				ImVec2 pos = ImGui::GetWindowPos();
+				g_dragOffset = ImVec2(mouse.x - pos.x, mouse.y - pos.y);
+				g_dragOffsetValid = true;
+			}
+			ImVec2 mouse = ImGui::GetIO().MousePos;
+			ImGui::SetWindowPos(ImVec2(mouse.x - g_dragOffset.x, mouse.y - g_dragOffset.y));
+		}
+		else
+		{
+			g_dragOffsetValid = false;
+		}
+
+		// Paint the hint over the invisible button.
+		{
+			ImDrawList* drawList = ImGui::GetWindowDrawList();
+			const ImGuiCol hintColour = (dragHovered || dragHeld)
+				? ImGuiCol_Text : ImGuiCol_TextDisabled;
+			drawList->AddText(ImVec2(dragOrigin.x + 2.0f, dragOrigin.y),
+				ImGui::GetColorU32(hintColour), "drag here to move");
+		}
+
+		ImGui::SameLine();
 		ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
 
 		ImGui::Spacing();
@@ -1296,11 +1362,15 @@ namespace {
 
 	void DrawPanel()
 	{
-		if (!g_positionSet)
+		// Place the window once. ImGuiCond_FirstUseEver means: "use this only
+		// if there is no position/size stored for this window yet", so a drag
+		// the user performs is preserved (and survives the next launch) rather
+		// than being overwritten on the following frame.
+		if (g_windowPlacementPending)
 		{
-			ImGui::SetNextWindowPos(g_initialPos, ImGuiCond_Always);
-			ImGui::SetNextWindowSize(ImVec2(kPanelWidth, kPanelHeight), ImGuiCond_Always);
-			g_positionSet = true;
+			ImGui::SetNextWindowPos(g_initialPos, ImGuiCond_FirstUseEver);
+			ImGui::SetNextWindowSize(g_initialSize, ImGuiCond_FirstUseEver);
+			g_windowPlacementPending = false;
 		}
 
 		const ImGuiWindowFlags windowFlags =
@@ -1314,8 +1384,7 @@ namespace {
 		// returns false and no content is drawn.
 		Snapshot snapshot = BeginRead();
 
-		if (ImGui::Begin(kWindowTitle, &g_visible, windowFlags))
-		{
+		if (ImGui::Begin(kWindowTitle, &g_visible, windowFlags))		{
 			DrawTemplateHeader();
 
 			if (ImGui::BeginTabBar("##bottomtabs", ImGuiTabBarFlags_None))
@@ -1376,6 +1445,12 @@ namespace {
 		HWND foreground = GetForegroundWindow();
 		if (!foreground) return false;
 
+		// Conquer is a multi-window client: the root frame, the render child and
+		// a few hidden message-only windows all belong to the same process. The
+		// old test compared the foreground window against a single cached HWND
+		// (the render window), which is almost never the one that owns focus -
+		// the root frame is - so the hotkeys were effectively dead. Comparing
+		// process ids accepts any of them.
 		DWORD processId = 0;
 		GetWindowThreadProcessId(foreground, &processId);
 		return processId == GetCurrentProcessId();
@@ -1385,7 +1460,11 @@ namespace {
 	// the key does not repeat the action.
 	bool KeyPressedEdge(int virtualKey, bool& wasDown)
 	{
-		bool down = (GetAsyncKeyState(virtualKey) & 0x8000) != 0;
+		// GetAsyncKeyState's low bit is "pressed since the last call", but it is
+		// per-thread and shared with every other reader. The high bit (currently
+		// down) plus our own latch is the reliable edge test.
+		SHORT state = GetAsyncKeyState(virtualKey);
+		bool down = (state & 0x8000) != 0;
 		bool pressed = down && !wasDown;
 		wasDown = down;
 		return pressed;
@@ -1400,8 +1479,8 @@ namespace {
 		static bool escapeDown = false;
 		static bool middleDown = false;
 
-		// Always sample, so the edge state stays correct even while another
-		// window has focus and we deliberately ignore the result.
+		// Sample unconditionally so the edge latches stay correct even while
+		// another window has focus and we deliberately ignore the result.
 		bool insert = KeyPressedEdge(VK_INSERT, insertDown);
 		bool f8 = KeyPressedEdge(VK_F8, f8Down);
 		bool f9 = KeyPressedEdge(VK_F9, f9Down);
@@ -1410,15 +1489,50 @@ namespace {
 		bool middle = KeyPressedEdge(VK_MBUTTON, middleDown);
 
 		// Only act while the game owns the foreground, so the overlay does not
-		// toggle while the user is typing in some other application.
+		// toggle while the user is typing in another application.
 		if (!IsGameForeground()) return;
 
-		if (insert || f8) g_visible = !g_visible;
+		// Insert and F8 are the show/hide pair.
+		if (insert || f8)
+		{
+			g_visible = !g_visible;
+
+			// Hiding the panel must not leave the overlay holding the mouse:
+			// ImGui's Win32 capture would otherwise keep swallowing clicks that
+			// belong to the game until the panel was shown again.
+			//
+			// We deliberately do NOT reach for ImGui's internal ClearActiveID()
+			// here (it lives in imgui_internal.h, not the public imgui.h). It is
+			// unnecessary: ProcessMessage() takes an explicit "overlay hidden"
+			// path that releases the Win32 capture, and ImGui drops its own
+			// ActiveId by itself once the window stops being submitted.
+			if (!g_visible)
+			{
+				if (g_renderWindow && ::GetCapture() == g_renderWindow)
+					::ReleaseCapture();
+
+				// Synthesise a release for any button ImGui still believes is
+				// held, so a hide mid-drag does not leave it stuck down.
+				ImGuiIO& io = ImGui::GetIO();
+				for (int button = 0; button < IM_COUNTOF(io.MouseDown); ++button)
+				{
+					if (io.MouseDown[button])
+						io.AddMouseButtonEvent(button, false);
+				}
+			}
+
+			HookLog("[Overlay] %s (Insert/F8)", g_visible ? "shown" : "hidden");
+		}
+
 		if (f9)  SetPaused(!IsPaused());
 		if (f10) { Clear(); g_hasSelection = false; g_autoScroll = true; }
 		if (escape && g_visible) g_visible = false;
 		if (middle && g_visible) g_visible = false;
 
+		// NOTE: toggling g_visible here, before NewFrame(), is deliberate - the
+		// panel is then drawn (or not) in the same frame, so Insert feels
+		// instant rather than one frame late.
+		//
 		// Auto-scroll (detach on scroll-up, re-attach at the bottom) is handled
 		// inside DrawPacketTable, i.e. after NewFrame() - the ImGui:: helpers
 		// are not valid before a frame has begun.
