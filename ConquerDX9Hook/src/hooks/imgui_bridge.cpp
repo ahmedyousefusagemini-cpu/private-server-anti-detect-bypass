@@ -124,7 +124,6 @@ bool ProcessMessage(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
 	{
 		::ReleaseCapture();
 		ImGui_ImplWin32_WndProcHandler(window, message, wParam, lParam);
-		g_mouseButtonsDown = 0;
 		return true;
 	}
 
