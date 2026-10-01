@@ -1,0 +1,146 @@
+﻿# Curated packet annotations - the human-meaningful layer on top of the
+# mechanically-recovered id -> CMsg<class> map (tools/data/ids_recv.tsv).
+#
+# Format:  <id> <TAB> <direction> <TAB> <short-name> <TAB> <description>
+#   direction: S = client->server only, R = server->client only, B = both
+#   short-name: the label shown in the overlay / logger
+#   description: one line, what the packet means
+#
+# Directions/descriptions below come from:
+#   - the recovered id->class map (Ghidra: CNetMsg::CreateNetMsg, FUN_00f41fce)
+#   - the send-side Create sites (see docs/packet-catalog.md)
+#   - observed traffic in packets.log / packet.log
+# Anything not listed here still gets its class name from ids_recv.tsv; this
+# table only overrides / enriches the entries that actually matter in a session.
+#
+# ---- login / handshake (login server: 0x04xx..0x09xx before world entry) ----
+0x0423	R	ServerHello	Login step 1: server sends the encryption seed ("CMsgEncryptCode"). Seeds the client's 16-byte key table. 8 bytes.
+0x0796	S	LoginAuth	Login step 2: client answers with the account/auth blob ("CMsgAccountEx", 472 B). Built from res.dat + machine key; body is opaque (encrypted credentials), not protobuf.
+0x0674	R	ServerNotify	Login step 3: pre-login acknowledgement ("CMsgPreLoginResp"). 8 bytes.
+0x0665	R	SessionData	Login step 4: 324-byte session challenge ("CMsgConnectEx") - repeated key blocks + 32-char hex session hash. Server list + key material.
+0x097D	S	AuthReply	Login step 5: client's 52-byte reply to the session challenge.
+0x089D	S	DxCheck	Machine/hardware fingerprint upload (188 B), ~14 s after login. 6 raw bytes hex-encoded; anti-cheat client attestation.
+0x0953	R	ServerInfo	Compact server info / ack after world entry.
+0x093E	R	UserCityInfo	516-byte player city/zone + world-state payload.
+0x093F	B	UserAbilityScore	Ability/attribute score block.
+0x093C	S	PbState f1=1	6-byte client ack (f1=1).
+0x0956	R	RefineEffect	Refine effect sync.
+0x0817	S	SelfState	6-byte self-state ping (f1=1).
+0x07E4	B	SessionPing	32-byte ping/echo pair (SEND then RECV).
+0x07F4	R	Ping	Server ping.
+0x086C	R	Time	Server time.
+0x0A36	B	KeepAlive	Heartbeat / item-ping tick (12 B each way). The steady keep-alive.
+
+# ---- world / movement ----
+0x0898	B	Walk	Movement sync. SEND = client walk request (target pos); RECV = authoritative position broadcast.
+0x0833	B	Action	Entity action (attack / cast / interact animation). Body is CMsgAction; the real sub-type is a field inside the protobuf (e.g. actionGetItemSet).
+0x0838	B	Interact	Interact with npc/object (attack, gather, dialogue trigger).
+0x08F4	R	EntitySnapshot	Player/entity spawn + periodic full stat snapshot (id, hp, mp, pos, name...). The dense one, ~288 per session.
+
+# ---- chat / social ----
+0x07FE	R	Chat/SysMsg	Chat + system message feed. Bodies carry the text.
+0x0939	R	Talk	Chat line (CMsgTalk). Carries speaker, channel, message.
+0x08E0	B	ChatText	Chat text / name block.
+0x08F9	R	SceneChat	Scene-local chat.
+0x0846	B	TradeBuddy	Trade partner info.
+0x0849	B	MailList	Mailbox list (sender/subject encoded in the body).
+
+# ---- inventory / items ----
+0x0988	B	Walk/MoveItem	Ground-item / map-item move sync (CMsgMapItem). ~198 per side.
+0x097B	R	ItemOp	Item operation result (CMsgItem).
+0x092E	R	ItemInfo	Item detail block (CMsgItemInfo), ~147 per session.
+0x080E	R	ItemInfoEx	Extended item info (large, 277-988 B).
+0x0963	R	ItemDrop	Npc/player drop event (CMsgNpcInfo context), 62 per session.
+0x086D	R	ItemStatus	Item status change.
+0x091F	R	Rank	Rank list entry.
+0x0923	R	BatchRefresh	Batched UI refresh (task / shop / etc.).
+0x0925	R	MapInfo	Map metadata (id, name, bounds).
+0x0809	R	EntityRefresh	Entity/magic list refresh.
+0x08B2	B	Npc	Npc info / interaction.
+0x0976	R	EntityAttrList	Attribute list for an entity (per-entity stat rows).
+0x0896	R	SilverTotal	Currency total (silver) update.
+0x08D8	R	SilverGain	Currency gain / drop (CMsgTeamAward gold split).
+0x082B	R	ServerList	Server list payload.
+0x0867	B	StatisticActive	Activity statistic toggle.
+0x08BA	B	BetLevel	Bet / gamble level.
+0x090C	B	SafeHeat	Account safe-heat (guard) status / auth token.
+0x0855	R	HangUp	Hang-up / auto-play state.
+0x084E	B	TaskStatus	Quest/task status.
+0x092E_1	R	-	(reserved)
+0x0983	B	Achievement	Objective/achievement progress.
+0x091F_1	R	-	(reserved)
+0x08B7	R	Instance	Instance (dungeon) state, f1=12.
+0x0990	R	GouYuInfo	Fishing/pet info list.
+0x09E4	R	VipConsumption	VIP consumption record.
+0x0A2C	B	Rune	Rune operation (f1=2, f2=<role id>).
+0x0942	B	DataUpload	TQP / raw data upload (111-901 B).
+0x091F_2	R	-	(reserved)
+0x0983_1	B	-	(reserved)
+0x08DE	B	PlayerAttriInfo	172-byte state blob (f1=0xa469ee00), HMAC-tagged.
+0x08F6	B	ZeroBuffer	520-byte zero-filled frame (padding / keep-alive).
+0x08F7	R	EnemyList	Enemy list (names HuntreX, karma...).
+0x0902	R	EquipLock	Equipment lock state.
+0x09F9	B	GlobalPointRank	Global point rank (f1=4,f9=1,f10=4).
+0x0810	R	BattlePass	Battle-pass state.
+0x081E	B	BeastsInfo	Pet/beast info block.
+0x07EB	B	ExchangeShop	Exchange shop (f1=3,f2=24702).
+0x07FB	R	BattlePassTaskList	Battle-pass task list.
+0x07F1	R	QualifyingDetailInfo	Qualifying/rank detail.
+0x081D	R	HairFaceStorage	Hair/face storage.
+0x0822	R	TexasPersonalInfo	Card-game personal info.
+0x082A	R	PresentUserData	Present/gift user data.
+0x082D	R	InnerStrengthInfo	Inner-strength (skill) info.
+0x084F	R	WeaponSkill	Weapon skill rows.
+0x085B	R	CompeteRank	Competition rank.
+0x085C	R	MailNotify	New-mail notification.
+0x085D	R	SignIn	Daily sign-in.
+0x0861	R	EnemyInvadeOpt	Enemy-invade (siege) options.
+0x0869	R	SubPro	Sub-profession info.
+0x086F	R	OwnKongfuBase	Kongfu (skill) base data.
+0x0875	R	OverheadLeagueInfo	Overhead league nameplate info.
+0x088A	R	Nosuch	"No such" negative-response (f1=16).
+0x0896_1	R	-	(reserved)
+0x0898_1	B	-	(reserved)
+0x089A	R	RaceTrackStatus	Race-track status.
+0x089B	R	VipFunctionValidNotify	VIP feature validity.
+0x08A3	R	Flower	Flower/gift.
+0x08B3	R	Data	Generic data block.
+0x08B9	R	CoatStorage	Coat (mount skin) storage.
+0x08CA	R	ActivityTask	Activity task.
+0x08CE	R	Friend	Friend list / presence.
+0x08D1	R	Peerage	Noble peerage info.
+0x08DA	R	Family	Family/clan info.
+0x08DB	R	SyndicateAttributeInfo	Syndicate attribute info.
+0x08E3	R	UserMonthCardInfo	Monthly-card info.
+0x08EC	R	GouYuAptitude	Fishing aptitude.
+0x08F2	R	Title	Title info.
+0x0905	R	-	(reserved)
+0x090B	R	MailContent	Mail body content.
+0x090D	R	TravelNotes	Travel notes.
+0x091E	R	CasinoInteractive	Casino interaction.
+0x0922	R	SynPrestige	Syndicate prestige.
+0x092D	R	CollectionStorage	Collection storage.
+0x0935	R	ItemRefineRecord	Refine record.
+0x093A	R	BattleEffectiveness	Combat effectiveness score.
+0x0942_1	B	-	(reserved)
+0x0963_1	R	-	(reserved)
+0x0973	B	CombatGear	Combat gear (f1=4).
+0x0975	B	OperatingAct	Operating activity.
+0x0983_2	B	-	(reserved)
+0x0995	R	RuneStorage	Rune storage query reply.
+0x0998	R	TitleStorage	Title storage.
+0x099D	R	LeagueOpt	League option.
+0x09AF	R	PCCOPInteract	Cop (offline-player) interaction.
+0x09CB	R	GodWeapons	God-weapon data.
+0x09EE	R	SwordAncestor	Sword-ancestor event.
+0x09F0	R	MedalStorage	Medal storage.
+
+# ---- observed high-volume ids (already named above, reinforced) ----
+# 0x07DF CMsgTaskDialog      - quest dialogue window (230 recv / 51 send)
+0x07DF	B	TaskDialog	Quest dialogue (npc talk window). Open/choice/close.
+0x07E9	R	UserSendShow	Trade-show / send-show payload.
+0x07D8	R	UserInfo	Full user info (name, level, guild...).
+0x080E_1	R	-	(reserved)
+
+# ---- ids proven send-only, no receiver in this build ----
+0x0805	?	Unknown805	Not present in this capture; structural hole in the receive switch. Reserved/unused on this build.

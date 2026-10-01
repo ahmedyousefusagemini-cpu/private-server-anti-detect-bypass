@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <cstring>
 #include "packet_capture.h"
+#include "packet_names.h"
 #include "log.h"
 #include "MinHook.h"
 
@@ -227,10 +228,10 @@ namespace {
 		SYSTEMTIME st;
 		GetLocalTime(&st);
 
-		fprintf(g_logFile, "[%02u:%02u:%02u.%03u] %-4s len=%u id=0x%04X\n",
+		fprintf(g_logFile, "[%02u:%02u:%02u.%03u] %-4s len=%-5u id=0x%04X  %s\n",
 			st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
 			direction == DirectionSend ? "SEND" : "RECV",
-			length, messageId);
+			length, messageId, PacketNames::Lookup(messageId));
 
 		uint32_t dump = length < g_fileBytes ? length : g_fileBytes;
 		for (uint32_t i = 0; i < dump; i += 16)

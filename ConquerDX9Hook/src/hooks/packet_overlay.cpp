@@ -21,6 +21,7 @@
 #include <cstdint>
 #include "packet_overlay.h"
 #include "packet_capture.h"
+#include "packet_names.h"
 #include "log.h"
 
 namespace PacketOverlay {
@@ -48,7 +49,9 @@ namespace {
 	const int kColDir = 168;
 	const int kColLen = 222;
 	const int kColId = 272;
-	const int kColPreview = 336;
+	const int kColName = 336;
+	const int kColNameWidth = 168;
+	const int kColPreview = kColName + kColNameWidth;
 	const int kColPreviewWidth = kPanelW - kColPreview - 12;
 
 	const int kDetailTop = kTitleH + kHeaderH + kListHeight;
@@ -75,6 +78,7 @@ namespace {
 	const COLORREF kColRecv = RGB(94, 220, 142);
 	const COLORREF kColWarn = RGB(255, 96, 96);
 	const COLORREF kColAccent = RGB(120, 180, 255);
+	const COLORREF kColName = RGB(196, 208, 226);
 
 	const uint32_t kPanelAlpha = 240;
 
@@ -237,6 +241,10 @@ namespace {
 			_snprintf_s(text, _TRUNCATE, "0x%04X", (unsigned)entry.messageId);
 			DrawTextClipped(kColId, y, 60, kColAccent, text);
 
+			// Message name recovered from Conquer.exe (CNetMsg::CreateNetMsg).
+			DrawTextClipped(kColName, y, kColNameWidth, selected ? RGB(255, 255, 255) : kColName,
+				PacketNames::Lookup(entry.messageId));
+
 			int maxChars = kColPreviewWidth / (g_res.charW > 0 ? g_res.charW : 7);
 			BuildHexPreview(entry, maxChars, text, sizeof(text));
 			DrawTextClipped(kColPreview, y, kColPreviewWidth, bodyColour, text);
@@ -268,10 +276,11 @@ namespace {
 		char clock[32];
 		FormatClock(entry->tick, clock, sizeof(clock));
 
-		_snprintf_s(text, _TRUNCATE, "#%06u  %s  len=%u  id=0x%04X  t=%s",
+		_snprintf_s(text, _TRUNCATE, "#%06u  %s  len=%u  id=0x%04X  %s  t=%s",
 			entry->seq,
 			entry->direction == DirectionSend ? "SEND" : "RECV",
-			(unsigned)entry->length, (unsigned)entry->messageId, clock);
+			(unsigned)entry->length, (unsigned)entry->messageId,
+			PacketNames::Lookup(entry->messageId), clock);
 
 		DrawTextClipped(kColSeq + 2, y + 4, kPanelW - 20,
 			entry->direction == DirectionSend ? kColSend : kColRecv, text);
@@ -357,6 +366,7 @@ namespace {
 		DrawTextClipped(kColDir, headerY, 50, kColDim, "DIR");
 		DrawTextClipped(kColLen, headerY, 46, kColDim, "LEN");
 		DrawTextClipped(kColId, headerY, 60, kColDim, "ID");
+		DrawTextClipped(kColName, headerY, kColNameWidth, kColDim, "MESSAGE");
 		DrawTextClipped(kColPreview, headerY, kColPreviewWidth, kColDim, "BYTES");
 
 		// Status bar
