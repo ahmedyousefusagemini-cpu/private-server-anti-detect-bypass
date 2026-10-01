@@ -112,4 +112,18 @@ namespace PacketCapture {
 	bool FileLoggingEnabled();
 	bool OverlayEnabledAtStartup();
 	const char* LogFilePath();
+
+	// ---- send support (used by packet_send.cpp) --------------------------
+	// The real CMyClientSocket::DoSendMsg, captured by the MinHook trampoline.
+	// Null until Install() has run and the SEND hook is in place. PacketSend
+	// uses it to re-issue a message through the client's own code path, so
+	// the size check, cipher and socket write all behave exactly as they do
+	// for a message the game built itself.
+	typedef int(__thiscall* DoSendMsgFn)(void* self, void* msg);
+	DoSendMsgFn RealDoSendMsg();
+
+	// The CMyClientSocket* seen on the most recent outgoing send. Needed
+	// because DoSendMsg is __thiscall - the socket is the implicit `this`.
+	// Null until at least one packet has been sent this session.
+	void* LastSendSocket();
 }

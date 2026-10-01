@@ -85,6 +85,27 @@ human-readable name recovered from the client's own dispatch table (see
 See [docs/overlay-imgui.md](docs/overlay-imgui.md) for how the ImGui backends
 are wired into the game's hook and reset path.
 
+### Sending packets (the jump sender)
+
+The panel can also **send** packets, not just read them. The Packets tab has a
+**Packet Builder** block under the hex dump:
+
+1. perform the action in-game once (e.g. jump) so the client sends the packet
+2. type its id (`0x0833`) and press **Load from Capture** — or select the row in
+   the table and press **Use Selected**
+3. edit the decoded protobuf fields, or the raw hex, then press **Send**
+   (optionally N times with a gap between them)
+
+The Map tab's **Travel** section drives the same sender: a repeat interval, a
+per-jump timestamp "lead", and an auto-jump toggle.
+
+A packet cannot be invented from scratch. `CMyClientSocket::DoSendMsg` calls a
+*virtual* `CMsg::GetSize()` through the message's vtable and refuses to send
+unless it equals the length field — so a raw buffer would fault, and a body
+this tool made up would be a guess. Instead the send hook keeps the vtable of a
+message the client itself sent, and re-issues it. See
+[docs/packet-send.md](docs/packet-send.md) for the full derivation.
+
 ### Controls
 
 | input | action |
@@ -168,6 +189,7 @@ ConquerDX9Hook/
       directx_hooks.cpp      EndScene / Reset / WndProc hooks
       packet_capture.cpp/.h  packet hooks + ring buffer + packets.log writer
       packet_names.h         generated id -> CMsg<Name> table (see tools/gen_names.py)
+      packet_send.cpp/.h     build and send packets (capture-and-replay)
       imgui_bridge.cpp/.h    Dear ImGui lifecycle + input (see docs/overlay-imgui.md)
       packet_overlay.cpp/.h  the in-game window (ImGui)
   libs/minhook/              MinHook (built from source, not the prebuilt lib)
@@ -180,6 +202,7 @@ tools/
   data/overrides.tsv         curated friendly names + descriptions
 docs/packet-hooks.md         Ghidra derivation of the two hook addresses
 docs/packet-catalog.md       every message id, its name and its meaning
+docs/packet-send.md          how a packet is built and sent (and why replay)
 docs/overlay-imgui.md        how ImGui is wired into the hook / reset path
 ```
 

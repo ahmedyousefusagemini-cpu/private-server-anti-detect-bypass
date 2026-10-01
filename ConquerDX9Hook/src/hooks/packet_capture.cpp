@@ -27,6 +27,7 @@
 #include <cstring>
 #include "packet_capture.h"
 #include "packet_names.h"
+#include "packet_send.h"
 #include "log.h"
 #include "MinHook.h"
 
@@ -51,11 +52,18 @@ namespace {
 	// Never read more than this from a claimed packet length.
 	const uint32_t kHardMaxLength = 2048;
 
-	typedef int(__thiscall* DoSendMsgFn)(void* self, void* msg);
+	// DoSendMsgFn is declared in packet_capture.h (PacketSend uses it too);
+	// only the receive-side typedef belongs here.
 	typedef uint16_t(__cdecl* GetMsgTypeFn)(const uint8_t* packet, int len);
 
 	DoSendMsgFn g_realDoSendMsg = nullptr;
 	GetMsgTypeFn g_realGetMsgType = nullptr;
+
+	// The socket the most recent outgoing send travelled on. DoSendMsg is
+	// __thiscall, so `self` is the CMyClientSocket*; PacketSend needs it to
+	// re-issue a message. Games routinely recreate the socket on reconnect,
+	// so it is refreshed on every send rather than cached once.
+	void* volatile g_lastSendSocket = nullptr;
 
 	CRITICAL_SECTION g_lock;
 	bool g_lockReady = false;
@@ -319,9 +327,19 @@ namespace {
 		{
 			__try
 			{
+				// Remember the socket for the send builder. Cheap, and it
+				// must happen even when capture itself is dropped below.
+				InterlockedExchangePointer(&g_lastSendSocket, self);
+
 				const uint8_t* packet = (const uint8_t*)msg + 4;
 				uint32_t length = *(const uint16_t*)packet;
 				Push(DirectionSend, packet, length);
+
+				// Let the builder learn this message's vtable. ObserveSend
+				// copies the whole live CMsg (vtable + length + body) the
+				// first time each id is seen, so a later re-send passes the
+				// CMsg::GetSize() check inside DoSendMsg.
+				PacketSend::ObserveSend(self, msg);
 			}
 			__except (EXCEPTION_EXECUTE_HANDLER)
 			{
@@ -477,5 +495,12 @@ long IndexOfSeq(const Snapshot& snapshot, uint32_t seq)
 bool FileLoggingEnabled() { return g_fileLog; }
 bool OverlayEnabledAtStartup() { return g_overlayStartup; }
 const char* LogFilePath() { return g_logPath; }
+
+DoSendMsgFn RealDoSendMsg() { return g_realDoSendMsg; }
+
+void* LastSendSocket()
+{
+	return InterlockedCompareExchangePointer(&g_lastSendSocket, nullptr, nullptr);
+}
 
 } // namespace PacketCapture

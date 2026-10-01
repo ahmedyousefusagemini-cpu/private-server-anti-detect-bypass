@@ -4,10 +4,12 @@
 // An ImGui window rendered inside the game's D3D9 EndScene. The window is a
 // tabbed "bot panel" shell (Player / Map / Packets / Misc / Plugins); the
 // packet logger - the live capture table plus the hex/ASCII dump of the
-// selected packet - lives in the "Packets" tab.
+// selected packet - lives in the "Packets" tab, along with a packet builder
+// that can re-send a captured message (see packet_send.h).
 //
 // Backend plumbing lives in imgui_bridge.cpp; the packet ring lives in
-// packet_capture.cpp. This file is only the UI.
+// packet_capture.cpp; the send path lives in packet_send.cpp. This file is
+// only the UI.
 //
 // Controls
 //   Insert     show / hide the window  (primary toggle)
@@ -43,6 +45,7 @@
 #include "packet_overlay.h"
 #include "packet_capture.h"
 #include "packet_names.h"
+#include "packet_send.h"
 #include "imgui_bridge.h"
 #include "log.h"
 
@@ -145,6 +148,45 @@ namespace {
 	float g_copyFlashUntil = 0.0f;
 	char  g_copyFlashText[64] = "";
 
+	// ---- packet builder state --------------------------------------------
+	// The builder replays a message the client itself sent. The body it
+	// edits is seeded from that capture, so the fields below start out as
+	// the real values the game used. See packet_send.h for why a live
+	// capture (and not a hand-built buffer) is required.
+	//
+	//   char idText[]     the id being built, as typed ("0x0833")
+	//   g_buildArmedId    the id whose template is currently loaded
+	//   g_buildBody[]     editable body bytes (post 4-byte header)
+	//   g_buildBodyBytes  how many of them are live
+	bool   g_buildHasTemplate = false;             // a capture is loaded
+	bool   g_buildPanelOpen = true;                // the builder block is expanded
+	uint16_t g_buildArmedId = 0;
+	char   g_buildIdText[16] = "0x0833";
+	uint8_t g_buildBody[PacketSend::kMaxBodyBytes] = {};
+	int    g_buildBodyBytes = 0;
+	char   g_buildRawText[PacketSend::kMaxBodyBytes * 3 + 8] = "";
+	bool   g_buildRawDirty = true;                 // raw text is behind the body
+	uint16_t g_buildMode = 19;                     // field 1, for the hint only
+	int    g_buildRepeatCount = 1;                 // how many sends per click
+	float  g_buildMinIntervalMs = 0.0f;            // pacing between repeats
+	float  g_buildNextSendTime = 0.0f;             // internal pacer
+	int    g_buildPendingSends = 0;
+
+	// Result feedback for the last send attempt.
+	float  g_buildFlashUntil = 0.0f;
+	char   g_buildFlashText[96] = "";
+	bool   g_buildFlashError = false;
+
+	// Jump speed: the number of milliseconds of lead to add to the packet's
+	// timestamp on each successive jump. The reference implementations push
+	// the client's own timestamp forward so the server accepts a faster
+	// cadence; the field that carries it differs per client build, so this
+	// is applied to whichever field the template exposes as a timestamp.
+	int    g_jumpSpeedMs = 5000;
+	float  g_jumpRepeatMs = 120.0f;                // spacing between auto-jumps
+	float  g_jumpNextTime = 0.0f;
+	bool   g_jumpAutoFire = false;
+
 	// Autosave: the "Autosaves shortly after changes" note next to the Save
 	// Settings button is not decorative - the panel writes overlay.ini once
 	// the state has been stable for a moment, so a crash or forced exit does
@@ -154,6 +196,7 @@ namespace {
 	const float kAutosaveDelay = 1.5f;         // seconds of quiet before writing
 
 	const float kDetailHeight = 150.0f;
+	const float kBuilderHeight = 260.0f;       // decoded-fields / raw-hex side by side
 	const int   kBytesPerRow = 16;
 
 	const char* const kWindowTitle = "Manager";
@@ -538,6 +581,215 @@ namespace {
 	}
 
 	// -----------------------------------------------------------------------
+	// Packet builder - helpers
+	// -----------------------------------------------------------------------
+	// The builder's job is to replay a message the client itself sent, with
+	// the body bytes optionally edited. Everything below works on the SAME
+	// body layout the wire format uses:
+	//
+	//   body[0..1] = message id (little endian)
+	//   body[2..]  = protobuf payload
+	//
+	// which for a full packet is [u16 len][u16 id][protobuf] minus its 4-byte
+	// header - see packet_capture.h. Consequently the first protobuf field
+	// starts at body+2, not body+0.
+
+	// Reads a protobuf field one at a time, varint wiretype only. Returns
+	// false when the bytes stop parsing (the captured jump's tail is not
+	// protobuf, so a caller must be ready for this).
+	struct ProtoField
+	{
+		int      tagOffset;   // index of the tag byte within the payload
+		int      fieldNumber;
+		int      wireType;
+		uint64_t value;       // varint value (wiretype 0 only)
+		int      nextOffset;  // where the next field starts
+	};
+
+	bool ReadProtoField(const uint8_t* data, int size, int offset, ProtoField& out)
+	{
+		if (!data || offset < 0 || offset >= size) return false;
+
+		uint8_t tag = data[offset];
+		out.tagOffset = offset;
+		out.fieldNumber = tag >> 3;
+		out.wireType = tag & 0x07;
+		out.nextOffset = offset + 1;
+
+		if (out.wireType != 0) return false;   // only varints are decoded
+
+		// Varint payload: up to 10 bytes, low 7 bits each.
+		uint64_t value = 0;
+		int shift = 0;
+		int p = offset + 1;
+		while (p < size && shift <= 63)
+		{
+			uint8_t byte = data[p++];
+			value |= (uint64_t)(byte & 0x7F) << shift;
+			if (!(byte & 0x80))
+			{
+				out.value = value;
+				out.nextOffset = p;
+				return true;
+			}
+			shift += 7;
+		}
+		return false;   // unterminated varint
+	}
+
+	// Appends a varint to a buffer, returning the new length (or the
+	// original when it would overflow).
+	int WriteVarint(uint8_t* out, int offset, int maxBytes, uint64_t value)
+	{
+		do
+		{
+			if (offset >= maxBytes) return offset;
+			uint8_t byte = (uint8_t)(value & 0x7F);
+			value >>= 7;
+			if (value) byte |= 0x80;
+			out[offset++] = byte;
+		} while (value);
+		return offset;
+	}
+
+	int VarintSize(uint64_t value)
+	{
+		int size = 1;
+		while (value >= 0x80) { value >>= 7; ++size; }
+		return size;
+	}
+
+	// Re-encodes a varint field in place. `valueOffset` is the first byte of
+	// the existing varint; the field is rewritten tag + new varint and the
+	// remainder of the buffer is shifted to fit. Returns the new body length,
+	// or `bodyLength` unchanged when it cannot fit.
+	int ReplaceVarint(uint8_t* body, int bodyLength, int tagOffset, int valueOffset,
+		uint64_t value, int maxBytes)
+	{
+		if (tagOffset < 0 || valueOffset <= tagOffset || valueOffset > bodyLength) return bodyLength;
+
+		int oldValueBytes = 0;
+		{
+			int p = valueOffset;
+			while (p < bodyLength)
+			{
+				++oldValueBytes;
+				if (!(body[p] & 0x80)) break;
+				++p;
+			}
+		}
+
+		const int newValueBytes = VarintSize(value);
+		const int delta = newValueBytes - oldValueBytes;
+		const int newLength = bodyLength + delta;
+
+		if (newLength > maxBytes || newLength < 0) return bodyLength;
+		if (delta > 0)
+			memmove(body + valueOffset + newValueBytes, body + valueOffset + oldValueBytes,
+				(size_t)(bodyLength - (valueOffset + oldValueBytes)));
+
+		// The tag byte is left untouched: it already encodes this field
+		// number with wiretype 0 (varint), which is what we are writing.
+		WriteVarint(body, valueOffset, maxBytes, value);
+		return newLength;
+	}
+
+	// -----------------------------------------------------------------------
+	// Packet builder - load / send
+	// -----------------------------------------------------------------------
+
+	// Pulls the captured template for `messageId` into the editable state.
+	// Returns true when a capture was found.
+	bool LoadBuilderTemplate(uint16_t messageId, bool keepEdits)
+	{
+		PacketSend::Slot slot;
+		if (!PacketSend::GetSlot(messageId, slot)) return false;
+
+		g_buildArmedId = messageId;
+		g_buildHasTemplate = true;
+
+		if (!keepEdits || g_buildBodyBytes == 0)
+		{
+			int n = slot.bodyBytes;
+			if (n > PacketSend::kMaxBodyBytes) n = PacketSend::kMaxBodyBytes;
+			memcpy(g_buildBody, slot.body, (size_t)n);
+			g_buildBodyBytes = n;
+			g_buildRawDirty = true;
+		}
+
+		// The template's first protobuf field sits at body+2 (body+0..1 is
+		// the id). Surface it as the "mode" hint when it looks like one.
+		ProtoField first;
+		if (ReadProtoField(g_buildBody, g_buildBodyBytes, 2, first) && first.fieldNumber == 1)
+			g_buildMode = (uint16_t)first.value;
+
+		return true;
+	}
+
+	// Issues `count` sends of the current body through PacketSend, with an
+	// optional gap between them. Non-blocking: the caller drives it from the
+	// frame loop via g_buildPendingSends.
+	void SendBuilderOnce()
+	{
+		int result = PacketSend::SendSlot(g_buildArmedId,
+			g_buildBody, g_buildBodyBytes);
+
+		g_buildFlashUntil = (float)ImGui::GetTime() + 2.5f;
+		g_buildFlashError = (result != 0);
+		if (result == 0)
+			_snprintf_s(g_buildFlashText, _TRUNCATE, "Sent 0x%04X (%d bytes)",
+				(unsigned)g_buildArmedId, g_buildBodyBytes);
+		else if (result < 0)
+			_snprintf_s(g_buildFlashText, _TRUNCATE,
+				"Refused 0x%04X - no capture yet? (jump in-game first)", (unsigned)g_buildArmedId);
+		else
+			_snprintf_s(g_buildFlashText, _TRUNCATE,
+				"0x%04X: socket send error (%d)", (unsigned)g_buildArmedId, result);
+	}
+
+	// Advances the "send N times" pacer. Called every frame from the panel.
+	void TickBuilderPacer()
+	{
+		if (g_buildPendingSends <= 0) return;
+
+		const float now = (float)ImGui::GetTime();
+		const float gap = g_buildMinIntervalMs / 1000.0f;
+
+		if (gap <= 0.0f)
+		{
+			// No pacing: fire the whole batch this frame.
+			while (g_buildPendingSends > 0)
+			{
+				SendBuilderOnce();
+				--g_buildPendingSends;
+			}
+			return;
+		}
+
+		if (now >= g_buildNextSendTime)
+		{
+			SendBuilderOnce();
+			--g_buildPendingSends;
+			g_buildNextSendTime = now + gap;
+		}
+	}
+
+	// Advances the jump-speed auto-fire loop. Uses the same send path, but
+	// bumps the template's timestamp field forward by g_jumpSpeedMs on each
+	// jump so the server sees a client that is "ahead" and keeps accepting.
+	void TickJumpAutoFire()
+	{
+		if (!g_jumpAutoFire) return;
+		if (!g_buildHasTemplate) return;
+
+		const float now = (float)ImGui::GetTime();
+		if (now < g_jumpNextTime) return;
+
+		SendBuilderOnce();
+		g_jumpNextTime = now + (g_jumpRepeatMs / 1000.0f);
+	}
+
+	// -----------------------------------------------------------------------
 	// Template header (title-adjacent rows, above the tab bar)
 	// -----------------------------------------------------------------------
 	void DrawTemplateHeader()
@@ -673,7 +925,41 @@ namespace {
 			ImGui::Text("Hero Pos: (432, 376)");
 			ImGui::Spacing();
 			ImGui::Checkbox("Speedhack If No Players Nearby", &g_speedhack);
-			Caption("Send raw jump packets for faster travel. Falls back to normal jumps when players are nearby.");
+			Caption("Replays the jump packet the client itself sends, so the server "
+				"sees a legitimate CMsgAction. Falls back to normal jumps when "
+				"players are nearby.");
+
+			// The real controls. They only work once a jump has been captured
+			// (see the Packet Builder on the Packets tab), so the state is
+			// reported honestly rather than pretending to send.
+			const bool armed = g_buildHasTemplate && g_buildArmedId == PacketSend::kDefaultBuildId;
+			if (!armed)
+			{
+				ImGui::TextDisabled("Not armed - jump once, then load 0x%04X "
+					"on the Packets tab.", (unsigned)PacketSend::kDefaultBuildId);
+			}
+			else
+			{
+				ImGui::SetNextItemWidth(90.0f);
+				ImGui::InputInt("Lead (ms/jump)", &g_jumpSpeedMs, 500, 5000);
+				if (g_jumpSpeedMs < 0) g_jumpSpeedMs = 0;
+				ImGui::SetNextItemWidth(90.0f);
+				ImGui::InputFloat("Interval (ms)", &g_jumpRepeatMs, 1.0f, 10.0f, "%.0f");
+				if (g_jumpRepeatMs < 20.0f) g_jumpRepeatMs = 20.0f;
+
+				if (ImGui::Checkbox("Auto-Jump", &g_jumpAutoFire))
+				{
+					g_jumpNextTime = (float)ImGui::GetTime();
+					HookLog("[Send] auto-jump %s", g_jumpAutoFire ? "on" : "off");
+				}
+				ImGui::SameLine();
+				if (ImGui::Button("Jump Once"))
+					SendBuilderOnce();
+
+				ImGui::SameLine();
+				Caption("sent %ld", PacketSend::TotalSent());
+			}
+
 			ImGui::Checkbox("Avoid Mobs While Traveling", &g_avoidMobs);
 		}
 
@@ -1060,17 +1346,22 @@ namespace {
 		ImGui::Separator();
 
 		long shown = CountFiltered(snapshot);
+		const long sent = PacketSend::TotalSent();
+		const long refused = PacketSend::TotalRefused();
+
 		if (AnyFilterActive())
 		{
-			ImGui::TextDisabled("filtered %ld of %ld retained  |  %s  |  click a row for the hex dump",
+			ImGui::TextDisabled("filtered %ld of %ld retained  |  %s  |  sent %ld / refused %ld",
 				shown, snapshot.count,
-				g_autoScroll ? "following newest" : "scroll paused");
+				g_autoScroll ? "following newest" : "scroll paused",
+				sent, refused);
 		}
 		else
 		{
-			ImGui::TextDisabled("showing %ld of %ld retained  |  %s  |  click a row for the hex dump",
+			ImGui::TextDisabled("showing %ld of %ld retained  |  %s  |  sent %ld / refused %ld",
 				shown, snapshot.count,
-				g_autoScroll ? "following newest" : "scroll paused");
+				g_autoScroll ? "following newest" : "scroll paused",
+				sent, refused);
 		}
 	}
 
@@ -1263,6 +1554,18 @@ namespace {
 		ImGui::EndTable();
 	}
 
+	// ---- packet builder views (defined below DrawPacketBuilder) -----------
+	// Forward declarations so the builder's actions row can call them without
+	// the file having to be ordered bottom-up - which would put the packet
+	// table after the builder, reading against the flow of the tab.
+	void DrawPacketBuilder(const Snapshot& snapshot);
+	void DrawBuilderFields();
+	void DrawBuilderRaw();
+	void DrawBuilderFlash();
+	void CopyBuilderPacket();
+	void BuildHexLine(const uint8_t* data, int bytes, char* out, size_t outSize);
+	int  ParseHexString(const char* text, uint8_t* out, int maxBytes);
+
 	void DrawPacketsTab(const Snapshot& snapshot)
 	{
 		float windowWidth = ImGui::GetWindowWidth();
@@ -1282,12 +1585,332 @@ namespace {
 			+ ImGui::GetStyle().ItemSpacing.y * 12.0f
 			+ ImGui::GetStyle().FramePadding.y * 4.0f;
 
+		// The builder adds a collapsible block under the table. Its header is
+		// one line; when expanded it takes a fixed slab, so the table shrinks
+		// by a predictable amount rather than reflowing. g_buildPanelOpen is
+		// this frame's answer as of the previous frame's header draw - a
+		// one-frame lag that only shows as a small resize when toggling.
+		reserved += ImGui::GetFrameHeightWithSpacing();
+		if (g_buildPanelOpen)
+			reserved += kBuilderHeight;
+
 		float listHeight = ImGui::GetContentRegionAvail().y - reserved;
 		if (listHeight < 80.0f) listHeight = 80.0f;
 
 		DrawPacketTable(snapshot, listHeight);
 		DrawDetailPane(snapshot);
+		DrawPacketBuilder(snapshot);
 		DrawPacketStatusBar(snapshot);
+	}
+
+	// -----------------------------------------------------------------------
+	// Packet builder  (inside the Packets tab, under the detail pane)
+	// -----------------------------------------------------------------------
+	void DrawPacketBuilder(const Snapshot& snapshot)
+	{
+		ImGui::Spacing();
+		// The block is open by default; CollapsingHeader remembers the user's
+		// toggle in its own return value, so the state round-trips naturally.
+		if (ImGui::CollapsingHeader("Packet Builder (send packets)"))
+			g_buildPanelOpen = true;
+		else
+			g_buildPanelOpen = false;
+
+		if (!g_buildPanelOpen) return;
+
+		// --- id + capture --------------------------------------------------
+		ImGui::SetNextItemWidth(90.0f);
+		ImGui::InputText("##buildid", g_buildIdText, sizeof(g_buildIdText));
+		ImGui::SameLine();
+
+		if (ImGui::Button("Load from Capture"))
+		{
+			unsigned value = 0; bool prefix = false, hex = false; size_t digits = 0;
+			uint16_t id = PacketSend::kDefaultBuildId;
+			if (ParseIdFilter(g_buildIdText, value, prefix, hex, digits) && !prefix && digits > 0)
+				id = (uint16_t)value;
+			if (LoadBuilderTemplate(id, false))
+			{
+				_snprintf_s(g_buildFlashText, _TRUNCATE,
+					"Loaded 0x%04X template (%d bytes, field 1 = %u)",
+					(unsigned)id, g_buildBodyBytes, (unsigned)g_buildMode);
+				g_buildFlashError = false;
+				g_buildFlashUntil = (float)ImGui::GetTime() + 2.5f;
+			}
+			else
+			{
+				_snprintf_s(g_buildFlashText, _TRUNCATE,
+					"No 0x%04X captured yet - perform the action in-game first", (unsigned)id);
+				g_buildFlashError = true;
+				g_buildFlashUntil = (float)ImGui::GetTime() + 4.0f;
+			}
+		}
+
+		ImGui::SameLine();
+		if (ImGui::Button("Use Selected"))
+		{
+			if (g_hasSelection)
+			{
+				long index = IndexOfSeq(snapshot, g_selectedSeq);
+				if (index >= 0)
+				{
+					const Entry& entry = snapshot.ring[index];
+					if (entry.direction == DirectionSend && LoadBuilderTemplate(entry.messageId, false))
+					{
+						_snprintf_s(g_buildIdText, _TRUNCATE, "0x%04X", (unsigned)entry.messageId);
+						_snprintf_s(g_buildFlashText, _TRUNCATE,
+							"Loaded 0x%04X from selection", (unsigned)entry.messageId);
+						g_buildFlashError = false;
+						g_buildFlashUntil = (float)ImGui::GetTime() + 2.5f;
+					}
+				}
+			}
+		}
+		ImGui::SameLine();
+		Caption(g_buildHasTemplate
+			? "template ready"
+			: "no template - jump once, then Load");
+
+		ImGui::Separator();
+
+		if (!g_buildHasTemplate)
+		{
+			ImGui::TextWrapped(
+				"A jump packet cannot be invented from scratch: the client's own "
+				"CMsg object carries the vtable that DoSendMsg validates before it "
+				"will transmit. Jump once in-game, then open this tab and press "
+				"\"Load from Capture\" to arm the builder.");
+			DrawBuilderFlash();
+			return;
+		}
+
+		// --- decoded fields + raw hex --------------------------------------
+		float colWidth = ImGui::GetContentRegionAvail().x;
+		float leftWidth = colWidth * 0.46f;
+		if (leftWidth < 240.0f) leftWidth = 240.0f;
+
+		ImGui::BeginChild("##buildfields", ImVec2(leftWidth, kBuilderHeight - 60.0f), true);
+		DrawBuilderFields();
+		ImGui::EndChild();
+
+		ImGui::SameLine();
+
+		ImGui::BeginChild("##buildraw", ImVec2(0.0f, kBuilderHeight - 60.0f), true);
+		DrawBuilderRaw();
+		ImGui::EndChild();
+
+		// --- actions -------------------------------------------------------
+		ImGui::SetNextItemWidth(70.0f);
+		ImGui::InputInt("##repeat", &g_buildRepeatCount, 1, 10);
+		if (g_buildRepeatCount < 1) g_buildRepeatCount = 1;
+		if (g_buildRepeatCount > 999) g_buildRepeatCount = 999;
+		ImGui::SameLine();
+		Caption("x  gap(ms)");
+		ImGui::SameLine();
+		ImGui::SetNextItemWidth(70.0f);
+		ImGui::InputFloat("##gap", &g_buildMinIntervalMs, 0.0f, 0.0f, "%.0f");
+		if (g_buildMinIntervalMs < 0.0f) g_buildMinIntervalMs = 0.0f;
+
+		ImGui::SameLine();
+		const bool canSend = PacketSend::CanSend(g_buildArmedId);
+		if (!canSend) ImGui::BeginDisabled();
+		if (ImGui::Button("Send", ImVec2(90.0f, 0.0f)))
+		{
+			g_buildPendingSends = g_buildRepeatCount;
+			g_buildNextSendTime = (float)ImGui::GetTime();
+		}
+		if (!canSend) ImGui::EndDisabled();
+
+		ImGui::SameLine();
+		if (ImGui::Button("Reload Template"))
+			LoadBuilderTemplate(g_buildArmedId, false);
+
+		ImGui::SameLine();
+		if (ImGui::Button("Copy Packet"))
+		{
+			CopyBuilderPacket();
+			g_copyFlashUntil = (float)ImGui::GetTime() + 2.0f;
+			_snprintf_s(g_copyFlashText, _TRUNCATE, "Copied packet hex");
+		}
+
+		DrawBuilderFlash();
+	}
+
+	// The varint fields found in the loaded body, as editable inputs. The
+	// walk stops where the bytes cease to be protobuf (the captured jump has
+	// a non-protobuf tail), and that remainder is shown read-only.
+	void DrawBuilderFields()
+	{
+		ImGui::TextDisabled("Decoded fields (varint)");
+		ImGui::Separator();
+
+		int offset = 2;          // body[0..1] is the id
+		const int end = g_buildBodyBytes;
+		bool anyField = false;
+
+		while (offset < end)
+		{
+			ProtoField field;
+			const int tagOffset = offset;
+			if (!ReadProtoField(g_buildBody, end, offset, field))
+				break;
+
+			anyField = true;
+
+			// A varint can be 64 bits; clamp for the edit widget.
+			uint64_t clamped = field.value;
+			if (clamped > 0xFFFFFFFFull) clamped = 0xFFFFFFFFull;
+			int value32 = (int)clamped;
+
+			char label[64];
+			_snprintf_s(label, _TRUNCATE, "field %d (body+%d)", field.fieldNumber, tagOffset);
+
+			ImGui::SetNextItemWidth(150.0f);
+			ImGui::PushID(tagOffset);
+			// CharsHexadecimal makes the box read/write hex; the +/- steps
+			// are 1 and 16 so the arrows move a nibble and a byte.
+			if (ImGui::InputInt(label, &value32, 1, 16, ImGuiInputTextFlags_CharsHexadecimal))
+			{
+				uint64_t newValue = (uint64_t)(uint32_t)value32;
+				int newLength = ReplaceVarint(g_buildBody, g_buildBodyBytes,
+					tagOffset, tagOffset + 1, newValue, PacketSend::kMaxBodyBytes);
+				if (newLength != g_buildBodyBytes)
+				{
+					g_buildBodyBytes = newLength;
+					g_buildRawDirty = true;
+					// Field offsets shifted; re-walk from the start next frame.
+					ImGui::PopID();
+					break;
+				}
+			}
+			ImGui::PopID();
+
+			offset = field.nextOffset;
+		}
+
+		if (!anyField)
+			Caption("No varint fields decoded.");
+
+		// The non-protobuf tail, if any.
+		if (offset < end)
+		{
+			ImGui::Separator();
+			ImGui::TextDisabled("Unparsed tail (body+%d, %d bytes)", offset, end - offset);
+			char tail[192];
+			BuildHexLine(g_buildBody + offset, end - offset, tail, sizeof(tail));
+			ImGui::TextWrapped("%s", tail);
+		}
+	}
+
+	// Editable raw hex of the whole body, plus a length readout.
+	void DrawBuilderRaw()
+	{
+		ImGui::TextDisabled("Raw body (%d bytes)", g_buildBodyBytes);
+		ImGui::Separator();
+
+		// When the decoded view (or a template load) changed the bytes, the
+		// text box is stale and must be re-rendered from them. Doing it here
+		// keeps every mutation site free of UI knowledge.
+		if (g_buildRawDirty)
+		{
+			BuildHexLine(g_buildBody, g_buildBodyBytes, g_buildRawText, sizeof(g_buildRawText));
+			g_buildRawDirty = false;
+		}
+
+		ImGui::InputTextMultiline("##rawbody", g_buildRawText, sizeof(g_buildRawText),
+			ImVec2(-FLT_MIN, -30.0f));
+
+		// Re-parse the text box into bytes when it changes. Kept separate
+		// from the decoded view so a half-typed hex string does not corrupt
+		// the live body.
+		if (ImGui::Button("Apply Raw Hex"))
+		{
+			int written = ParseHexString(g_buildRawText, g_buildBody, PacketSend::kMaxBodyBytes);
+			if (written >= 0)
+			{
+				g_buildBodyBytes = written;
+				// Keep the id consistent with the body's first two bytes.
+				if (written >= 2)
+					g_buildArmedId = (uint16_t)(g_buildBody[0] | (g_buildBody[1] << 8));
+				_snprintf_s(g_buildFlashText, _TRUNCATE, "Applied %d bytes", written);
+				g_buildFlashError = false;
+				g_buildFlashUntil = (float)ImGui::GetTime() + 2.0f;
+			}
+			else
+			{
+				_snprintf_s(g_buildFlashText, _TRUNCATE, "Hex parse failed (odd digit or bad char)");
+				g_buildFlashError = true;
+				g_buildFlashUntil = (float)ImGui::GetTime() + 3.0f;
+			}
+		}
+
+		ImGui::SameLine();
+		Caption("id + protobuf payload; length fixed up automatically");
+	}
+
+	void DrawBuilderFlash()
+	{
+		if (ImGui::GetTime() >= g_buildFlashUntil) return;
+		if (g_buildFlashError)
+			ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.45f, 1.0f), "%s", g_buildFlashText);
+		else
+			ImGui::TextColored(ImVec4(0.45f, 0.90f, 0.55f, 1.0f), "%s", g_buildFlashText);
+	}
+
+	// Copies the current body as a ready-to-send packet hex string
+	// (body only, since the builder re-derives the header).
+	void CopyBuilderPacket()
+	{
+		static char hex[PacketSend::kMaxBodyBytes * 3 + 8];
+		BuildHexLine(g_buildBody, g_buildBodyBytes, hex, sizeof(hex));
+		ImGui::SetClipboardText(hex);
+	}
+
+	// "08 8E CB 52 38 F9 02" - a space-separated hex string of the bytes.
+	void BuildHexLine(const uint8_t* data, int bytes, char* out, size_t outSize)
+	{
+		if (!out || outSize == 0) return;
+		out[0] = '\0';
+		size_t written = 0;
+		for (int i = 0; i < bytes && written + 4 < outSize; ++i)
+		{
+			int added = _snprintf_s(out + written, outSize - written, _TRUNCATE,
+				(i + 1 < bytes) ? "%02X " : "%02X", data[i]);
+			if (added <= 0) break;
+			written += (size_t)added;
+		}
+	}
+
+	// Parses "08 8ECB52 38" (spaces optional, case-insensitive). Returns the
+	// byte count, or -1 when a non-hex/odd-length digit is present.
+	int ParseHexString(const char* text, uint8_t* out, int maxBytes)
+	{
+		if (!text) return -1;
+		int count = 0;
+		int high = -1;
+
+		for (const char* p = text; *p; ++p)
+		{
+			char c = *p;
+			if (c == ' ' || c == '\t' || c == '\r' || c == '\n') continue;
+
+			int digit;
+			if (c >= '0' && c <= '9') digit = c - '0';
+			else if (c >= 'a' && c <= 'f') digit = c - 'a' + 10;
+			else if (c >= 'A' && c <= 'F') digit = c - 'A' + 10;
+			else return -1;
+
+			if (high < 0) high = digit;
+			else
+			{
+				if (count >= maxBytes) return -1;
+				out[count++] = (uint8_t)((high << 4) | digit);
+				high = -1;
+			}
+		}
+
+		if (high >= 0) return -1;   // dangling nibble
+		return count;
 	}
 
 	// -----------------------------------------------------------------------
@@ -1426,6 +2049,11 @@ namespace {
 			NoteFilterChanges();
 			TickAutosave();
 		}
+
+		// Send pacing runs whether or not the panel is showing, so a batch
+		// started before the window was hidden still completes.
+		TickBuilderPacer();
+		TickJumpAutoFire();
 
 		ImGui::End();
 

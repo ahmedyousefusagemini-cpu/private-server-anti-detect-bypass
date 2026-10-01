@@ -80,6 +80,9 @@
     <ClInclude Include="src\hooks\packet_capture.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="src\hooks\packet_send.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="src\hooks\packet_overlay.h">
       <Filter>Header Files</Filter>
     </ClInclude>
