@@ -232,6 +232,18 @@ int SendSlot(uint16_t messageId, const uint8_t* bodyOverride, int bodyOverrideBy
 		bodyBytes = bodyOverrideBytes;
 		if (bodyBytes < 2) bodyBytes = 2;              // room for the id
 		if (bodyBytes > kMaxBodyBytes) bodyBytes = kMaxBodyBytes;
+
+		// The body carries its own id at [0..1], and the vtable we are about
+		// to borrow came from `messageId`'s slot. If an edit changed the id
+		// but not the template, the message would go out under whichever
+		// class's vtable we happen to hold - a mismatch the client's own
+		// dispatch would never produce. Refuse rather than send that.
+		const uint16_t bodyId = (uint16_t)(body[0] | (body[1] << 8));
+		if (bodyId != messageId)
+		{
+			InterlockedIncrement(&g_totalRefused);
+			return -2;                                 // id / vtable mismatch
+		}
 	}
 	if (bodyBytes < 2) bodyBytes = 2;
 

@@ -180,9 +180,12 @@ namespace {
 	// Jump speed: the number of milliseconds of lead to add to the packet's
 	// timestamp on each successive jump. The reference implementations push
 	// the client's own timestamp forward so the server accepts a faster
-	// cadence; the field that carries it differs per client build, so this
-	// is applied to whichever field the template exposes as a timestamp.
+	// cadence. The field number carrying that timestamp differs per client
+	// build, so it is a separate, editable setting rather than a hardcoded
+	// index - for the captured 0x0833 action packet it is field 9 (a
+	// milliseconds-uptime value: 6666000 in the dump).
 	int    g_jumpSpeedMs = 5000;
+	int    g_jumpTimestampField = 9;               // protobuf field carrying the client clock
 	float  g_jumpRepeatMs = 120.0f;                // spacing between auto-jumps
 	float  g_jumpNextTime = 0.0f;
 	bool   g_jumpAutoFire = false;
@@ -599,29 +602,53 @@ namespace {
 	// protobuf, so a caller must be ready for this).
 	struct ProtoField
 	{
-		int      tagOffset;   // index of the tag byte within the payload
+		int      tagOffset;    // index of the first tag byte within the payload
+		int      tagBytes;     // 1, 2, ... (a protobuf tag is itself a varint)
 		int      fieldNumber;
 		int      wireType;
-		uint64_t value;       // varint value (wiretype 0 only)
-		int      nextOffset;  // where the next field starts
+		int      valueOffset;  // index of the first varint byte (after the tag)
+		uint64_t value;        // varint value (wiretype 0 only)
+		int      nextOffset;   // where the next field starts
 	};
 
+	// Reads one protobuf field, varint wiretype only. The TAG is itself a
+	// varint, so field numbers above 15 use two or more tag bytes - e.g.
+	// field 17 is "88 01" and field 20 is "A0 01". Treating the tag as a
+	// single byte mis-locates the value for every such field, which both
+	// mis-decodes the field AND silently corrupts the packet when the value
+	// is edited (the write would land on the tag's second byte).
 	bool ReadProtoField(const uint8_t* data, int size, int offset, ProtoField& out)
 	{
 		if (!data || offset < 0 || offset >= size) return false;
 
-		uint8_t tag = data[offset];
 		out.tagOffset = offset;
-		out.fieldNumber = tag >> 3;
-		out.wireType = tag & 0x07;
-		out.nextOffset = offset + 1;
 
-		if (out.wireType != 0) return false;   // only varints are decoded
-
-		// Varint payload: up to 10 bytes, low 7 bits each.
-		uint64_t value = 0;
+		// Decode the tag varint.
+		uint64_t tag = 0;
 		int shift = 0;
-		int p = offset + 1;
+		int p = offset;
+		while (p < size && shift <= 63)
+		{
+			uint8_t byte = data[p++];
+			tag |= (uint64_t)(byte & 0x7F) << shift;
+			if (!(byte & 0x80)) break;
+			shift += 7;
+		}
+		if (p >= size && shift > 63) return false;      // unterminated tag
+		if (p > offset && (data[p - 1] & 0x80)) return false;  // ran off the end
+
+		out.tagBytes = p - offset;
+		out.fieldNumber = (int)(tag >> 3);
+		out.wireType = (int)(tag & 0x07);
+		out.valueOffset = p;
+		out.nextOffset = p;
+
+		if (out.fieldNumber <= 0) return false;         // 0 is not a valid field
+		if (out.wireType != 0) return false;            // only varints decoded
+
+		// Decode the value varint.
+		uint64_t value = 0;
+		shift = 0;
 		while (p < size && shift <= 63)
 		{
 			uint8_t byte = data[p++];
@@ -634,7 +661,7 @@ namespace {
 			}
 			shift += 7;
 		}
-		return false;   // unterminated varint
+		return false;   // unterminated value
 	}
 
 	// Appends a varint to a buffer, returning the new length (or the
@@ -660,36 +687,37 @@ namespace {
 	}
 
 	// Re-encodes a varint field in place. `valueOffset` is the first byte of
-	// the existing varint; the field is rewritten tag + new varint and the
-	// remainder of the buffer is shifted to fit. Returns the new body length,
-	// or `bodyLength` unchanged when it cannot fit.
-	int ReplaceVarint(uint8_t* body, int bodyLength, int tagOffset, int valueOffset,
+	// the existing value varint (AFTER the tag, which may be multi-byte). The
+	// new varint is written there and the remainder of the buffer is shifted
+	// to fit. Returns the new body length, or `bodyLength` unchanged when the
+	// field cannot fit.
+	int ReplaceVarint(uint8_t* body, int bodyLength, int valueOffset,
 		uint64_t value, int maxBytes)
 	{
-		if (tagOffset < 0 || valueOffset <= tagOffset || valueOffset > bodyLength) return bodyLength;
+		if (!body || valueOffset <= 0 || valueOffset >= bodyLength) return bodyLength;
 
+		// Measure the existing value varint: bytes until one without bit 7.
 		int oldValueBytes = 0;
+		int p = valueOffset;
+		while (p < bodyLength)
 		{
-			int p = valueOffset;
-			while (p < bodyLength)
-			{
-				++oldValueBytes;
-				if (!(body[p] & 0x80)) break;
-				++p;
-			}
+			++oldValueBytes;
+			if (!(body[p] & 0x80)) break;
+			++p;
 		}
+		if (oldValueBytes == 0) return bodyLength;
 
 		const int newValueBytes = VarintSize(value);
 		const int delta = newValueBytes - oldValueBytes;
 		const int newLength = bodyLength + delta;
 
 		if (newLength > maxBytes || newLength < 0) return bodyLength;
-		if (delta > 0)
-			memmove(body + valueOffset + newValueBytes, body + valueOffset + oldValueBytes,
+
+		if (delta != 0)
+			memmove(body + valueOffset + newValueBytes,
+				body + valueOffset + oldValueBytes,
 				(size_t)(bodyLength - (valueOffset + oldValueBytes)));
 
-		// The tag byte is left untouched: it already encodes this field
-		// number with wiretype 0 (varint), which is what we are writing.
 		WriteVarint(body, valueOffset, maxBytes, value);
 		return newLength;
 	}
@@ -700,25 +728,34 @@ namespace {
 
 	// Pulls the captured template for `messageId` into the editable state.
 	// Returns true when a capture was found.
+	//
+	// `keepEdits` only makes sense when it is the SAME id already loaded -
+	// keeping the edits while switching id would leave the body carrying one
+	// id and the slot holding another class's vtable, which SendSlot refuses
+	// with -2. So a differing id always overwrites the body.
 	bool LoadBuilderTemplate(uint16_t messageId, bool keepEdits)
 	{
 		PacketSend::Slot slot;
 		if (!PacketSend::GetSlot(messageId, slot)) return false;
 
+		const bool sameId = g_buildHasTemplate && g_buildArmedId == messageId;
+		const bool keep = keepEdits && sameId && g_buildBodyBytes > 0;
+
 		g_buildArmedId = messageId;
 		g_buildHasTemplate = true;
 
-		if (!keepEdits || g_buildBodyBytes == 0)
+		if (!keep)
 		{
 			int n = slot.bodyBytes;
 			if (n > PacketSend::kMaxBodyBytes) n = PacketSend::kMaxBodyBytes;
+			if (n < 2) n = 2;                       // a body always holds an id
 			memcpy(g_buildBody, slot.body, (size_t)n);
 			g_buildBodyBytes = n;
 			g_buildRawDirty = true;
 		}
 
-		// The template's first protobuf field sits at body+2 (body+0..1 is
-		// the id). Surface it as the "mode" hint when it looks like one.
+		// The first protobuf field sits at body+2 (body[0..1] is the id).
+		// Surface it as the "field 1" hint when there is one.
 		ProtoField first;
 		if (ReadProtoField(g_buildBody, g_buildBodyBytes, 2, first) && first.fieldNumber == 1)
 			g_buildMode = (uint16_t)first.value;
@@ -726,19 +763,23 @@ namespace {
 		return true;
 	}
 
-	// Issues `count` sends of the current body through PacketSend, with an
-	// optional gap between them. Non-blocking: the caller drives it from the
-	// frame loop via g_buildPendingSends.
+	// Issues one send of the current body through PacketSend. The caller
+	// drives repetition (see g_buildPendingSends).
 	void SendBuilderOnce()
 	{
 		int result = PacketSend::SendSlot(g_buildArmedId,
 			g_buildBody, g_buildBodyBytes);
 
-		g_buildFlashUntil = (float)ImGui::GetTime() + 2.5f;
+		g_buildFlashUntil = (float)ImGui::GetTime() + 3.0f;
 		g_buildFlashError = (result != 0);
 		if (result == 0)
 			_snprintf_s(g_buildFlashText, _TRUNCATE, "Sent 0x%04X (%d bytes)",
 				(unsigned)g_buildArmedId, g_buildBodyBytes);
+		else if (result == -2)
+			_snprintf_s(g_buildFlashText, _TRUNCATE,
+				"Body id 0x%04X != armed 0x%04X - reload the template",
+				(unsigned)(g_buildBodyBytes >= 2 ? (g_buildBody[0] | (g_buildBody[1] << 8)) : 0),
+				(unsigned)g_buildArmedId);
 		else if (result < 0)
 			_snprintf_s(g_buildFlashText, _TRUNCATE,
 				"Refused 0x%04X - no capture yet? (jump in-game first)", (unsigned)g_buildArmedId);
@@ -748,6 +789,12 @@ namespace {
 	}
 
 	// Advances the "send N times" pacer. Called every frame from the panel.
+	//
+	// Even with no gap the batch is spread over frames: each send is a
+	// blocking socket write, so firing a whole 999-send batch in one frame
+	// would stall the render thread (and the game with it). One send per
+	// frame is still 60+ per second, which is as fast as the un-paced case
+	// was ever going to be useful.
 	void TickBuilderPacer()
 	{
 		if (g_buildPendingSends <= 0) return;
@@ -757,12 +804,8 @@ namespace {
 
 		if (gap <= 0.0f)
 		{
-			// No pacing: fire the whole batch this frame.
-			while (g_buildPendingSends > 0)
-			{
-				SendBuilderOnce();
-				--g_buildPendingSends;
-			}
+			SendBuilderOnce();
+			--g_buildPendingSends;
 			return;
 		}
 
@@ -775,8 +818,15 @@ namespace {
 	}
 
 	// Advances the jump-speed auto-fire loop. Uses the same send path, but
-	// bumps the template's timestamp field forward by g_jumpSpeedMs on each
-	// jump so the server sees a client that is "ahead" and keeps accepting.
+	// before each jump it rolls the template's timestamp field forward by
+	// g_jumpSpeedMs, so the server keeps seeing a client that is legitimately
+	// "ahead" rather than a burst of identical timestamps.
+	//
+	// The lead is applied to g_jumpTimestampField. When that field is not
+	// present (a different packet shape) the auto-fire still runs - it just
+	// replays the template verbatim, which is what the manual Send does.
+	void AdvanceTimestampField(int fieldNumber, uint64_t delta);   // defined below
+
 	void TickJumpAutoFire()
 	{
 		if (!g_jumpAutoFire) return;
@@ -785,8 +835,46 @@ namespace {
 		const float now = (float)ImGui::GetTime();
 		if (now < g_jumpNextTime) return;
 
+		if (g_jumpSpeedMs > 0 && g_jumpTimestampField > 0)
+			AdvanceTimestampField(g_jumpTimestampField, (uint64_t)g_jumpSpeedMs);
+
 		SendBuilderOnce();
 		g_jumpNextTime = now + (g_jumpRepeatMs / 1000.0f);
+	}
+
+	// Finds `fieldNumber` in the live body and adds `delta` to its varint
+	// value, re-encoding in place. Silent when the field is absent or the
+	// edit does not fit - the caller is the auto-fire loop, which must not
+	// stall or spam on a shape it did not expect.
+	void AdvanceTimestampField(int fieldNumber, uint64_t delta)
+	{
+		if (fieldNumber <= 0 || g_buildBodyBytes <= 2) return;
+
+		int offset = 2;                         // body[0..1] is the id
+		const int end = g_buildBodyBytes;
+
+		while (offset < end)
+		{
+			ProtoField field;
+			if (!ReadProtoField(g_buildBody, end, offset, field)) return;
+			if (field.fieldNumber == fieldNumber)
+			{
+				// Guard the add: some fields are all-ones sentinels
+				// (field 20 in the captured packet), and rolling one
+				// forward would silently turn it into a small number.
+				if (field.value > 0xFFFFFFFFFFFFFFFFull - delta) return;
+
+				int newLength = ReplaceVarint(g_buildBody, g_buildBodyBytes,
+					field.valueOffset, field.value + delta, PacketSend::kMaxBodyBytes);
+				if (newLength != g_buildBodyBytes)
+				{
+					g_buildBodyBytes = newLength;
+					g_buildRawDirty = true;
+				}
+				return;
+			}
+			offset = field.nextOffset;
+		}
 	}
 
 	// -----------------------------------------------------------------------
@@ -943,6 +1031,13 @@ namespace {
 				ImGui::SetNextItemWidth(90.0f);
 				ImGui::InputInt("Lead (ms/jump)", &g_jumpSpeedMs, 500, 5000);
 				if (g_jumpSpeedMs < 0) g_jumpSpeedMs = 0;
+				ImGui::SameLine();
+				// The lead is added to this protobuf field of the template -
+				// the one carrying the client clock. 0 disables the lead and
+				// replays the capture byte-for-byte.
+				ImGui::SetNextItemWidth(60.0f);
+				ImGui::InputInt("lead field ##jump", &g_jumpTimestampField, 1, 5);
+				if (g_jumpTimestampField < 0) g_jumpTimestampField = 0;
 				ImGui::SetNextItemWidth(90.0f);
 				ImGui::InputFloat("Interval (ms)", &g_jumpRepeatMs, 1.0f, 10.0f, "%.0f");
 				if (g_jumpRepeatMs < 20.0f) g_jumpRepeatMs = 20.0f;
@@ -1630,21 +1725,28 @@ namespace {
 		if (ImGui::Button("Load from Capture"))
 		{
 			unsigned value = 0; bool prefix = false, hex = false; size_t digits = 0;
-			uint16_t id = PacketSend::kDefaultBuildId;
-			if (ParseIdFilter(g_buildIdText, value, prefix, hex, digits) && !prefix && digits > 0)
-				id = (uint16_t)value;
-			if (LoadBuilderTemplate(id, false))
+			const bool parsed = ParseIdFilter(g_buildIdText, value, prefix, hex, digits);
+			if (!parsed || prefix || digits == 0)
+			{
+				// Do not quietly fall back to the default id - the user
+				// would be arming something they did not ask for.
+				_snprintf_s(g_buildFlashText, _TRUNCATE,
+					"Type an id first, e.g. 0x%04X", (unsigned)PacketSend::kDefaultBuildId);
+				g_buildFlashError = true;
+				g_buildFlashUntil = (float)ImGui::GetTime() + 3.0f;
+			}
+			else if (LoadBuilderTemplate((uint16_t)value, false))
 			{
 				_snprintf_s(g_buildFlashText, _TRUNCATE,
 					"Loaded 0x%04X template (%d bytes, field 1 = %u)",
-					(unsigned)id, g_buildBodyBytes, (unsigned)g_buildMode);
+					(unsigned)value, g_buildBodyBytes, (unsigned)g_buildMode);
 				g_buildFlashError = false;
 				g_buildFlashUntil = (float)ImGui::GetTime() + 2.5f;
 			}
 			else
 			{
 				_snprintf_s(g_buildFlashText, _TRUNCATE,
-					"No 0x%04X captured yet - perform the action in-game first", (unsigned)id);
+					"No 0x%04X captured yet - perform the action in-game first", (unsigned)value);
 				g_buildFlashError = true;
 				g_buildFlashUntil = (float)ImGui::GetTime() + 4.0f;
 			}
@@ -1653,17 +1755,47 @@ namespace {
 		ImGui::SameLine();
 		if (ImGui::Button("Use Selected"))
 		{
-			if (g_hasSelection)
+			// Every failure path reports why - a button that appears to do
+			// nothing is worse than one that explains itself.
+			if (!g_hasSelection)
+			{
+				_snprintf_s(g_buildFlashText, _TRUNCATE, "Select a packet in the table first");
+				g_buildFlashError = true;
+				g_buildFlashUntil = (float)ImGui::GetTime() + 3.0f;
+			}
+			else
 			{
 				long index = IndexOfSeq(snapshot, g_selectedSeq);
-				if (index >= 0)
+				if (index < 0)
+				{
+					_snprintf_s(g_buildFlashText, _TRUNCATE, "That packet has scrolled out of the ring");
+					g_buildFlashError = true;
+					g_buildFlashUntil = (float)ImGui::GetTime() + 3.0f;
+				}
+				else
 				{
 					const Entry& entry = snapshot.ring[index];
-					if (entry.direction == DirectionSend && LoadBuilderTemplate(entry.messageId, false))
+					if (entry.direction != DirectionSend)
+					{
+						_snprintf_s(g_buildFlashText, _TRUNCATE,
+							"0x%04X is a RECV packet - only SEND packets can be replayed",
+							(unsigned)entry.messageId);
+						g_buildFlashError = true;
+						g_buildFlashUntil = (float)ImGui::GetTime() + 3.0f;
+					}
+					else if (!LoadBuilderTemplate(entry.messageId, false))
+					{
+						_snprintf_s(g_buildFlashText, _TRUNCATE,
+							"0x%04X has no captured send to replay", (unsigned)entry.messageId);
+						g_buildFlashError = true;
+						g_buildFlashUntil = (float)ImGui::GetTime() + 3.0f;
+					}
+					else
 					{
 						_snprintf_s(g_buildIdText, _TRUNCATE, "0x%04X", (unsigned)entry.messageId);
 						_snprintf_s(g_buildFlashText, _TRUNCATE,
-							"Loaded 0x%04X from selection", (unsigned)entry.messageId);
+							"Loaded 0x%04X from selection (%d bytes)",
+							(unsigned)entry.messageId, g_buildBodyBytes);
 						g_buildFlashError = false;
 						g_buildFlashUntil = (float)ImGui::GetTime() + 2.5f;
 					}
@@ -1740,9 +1872,11 @@ namespace {
 		DrawBuilderFlash();
 	}
 
-	// The varint fields found in the loaded body, as editable inputs. The
-	// walk stops where the bytes cease to be protobuf (the captured jump has
-	// a non-protobuf tail), and that remainder is shown read-only.
+	// The varint fields in the loaded body, as editable inputs. The walk
+	// runs field to field and stops at the first byte that is not a varint
+	// tag (a non-varint wiretype, or a malformed run). For the captured
+	// 0x0833 packet it consumes the whole body; whatever is left over is
+	// shown read-only rather than silently dropped.
 	void DrawBuilderFields()
 	{
 		ImGui::TextDisabled("Decoded fields (varint)");
@@ -1755,7 +1889,6 @@ namespace {
 		while (offset < end)
 		{
 			ProtoField field;
-			const int tagOffset = offset;
 			if (!ReadProtoField(g_buildBody, end, offset, field))
 				break;
 
@@ -1767,24 +1900,28 @@ namespace {
 			int value32 = (int)clamped;
 
 			char label[64];
-			_snprintf_s(label, _TRUNCATE, "field %d (body+%d)", field.fieldNumber, tagOffset);
+			_snprintf_s(label, _TRUNCATE, "field %d (body+%d)", field.fieldNumber, field.tagOffset);
 
 			ImGui::SetNextItemWidth(150.0f);
-			ImGui::PushID(tagOffset);
+			ImGui::PushID(field.tagOffset);
 			// CharsHexadecimal makes the box read/write hex; the +/- steps
 			// are 1 and 16 so the arrows move a nibble and a byte.
 			if (ImGui::InputInt(label, &value32, 1, 16, ImGuiInputTextFlags_CharsHexadecimal))
 			{
 				uint64_t newValue = (uint64_t)(uint32_t)value32;
-				int newLength = ReplaceVarint(g_buildBody, g_buildBodyBytes,
-					tagOffset, tagOffset + 1, newValue, PacketSend::kMaxBodyBytes);
-				if (newLength != g_buildBodyBytes)
+				if (newValue != field.value)   // only rewrite on an actual change
 				{
-					g_buildBodyBytes = newLength;
-					g_buildRawDirty = true;
-					// Field offsets shifted; re-walk from the start next frame.
-					ImGui::PopID();
-					break;
+					int newLength = ReplaceVarint(g_buildBody, g_buildBodyBytes,
+						field.valueOffset, newValue, PacketSend::kMaxBodyBytes);
+					if (newLength != g_buildBodyBytes)
+					{
+						g_buildBodyBytes = newLength;
+						g_buildRawDirty = true;
+						// Every later field's offset just shifted, so stop
+						// drawing now and re-walk from the start next frame.
+						ImGui::PopID();
+						break;
+					}
 				}
 			}
 			ImGui::PopID();
@@ -1795,7 +1932,7 @@ namespace {
 		if (!anyField)
 			Caption("No varint fields decoded.");
 
-		// The non-protobuf tail, if any.
+		// Anything the field walk could not consume (normally nothing).
 		if (offset < end)
 		{
 			ImGui::Separator();
@@ -1833,12 +1970,29 @@ namespace {
 			if (written >= 0)
 			{
 				g_buildBodyBytes = written;
-				// Keep the id consistent with the body's first two bytes.
-				if (written >= 2)
-					g_buildArmedId = (uint16_t)(g_buildBody[0] | (g_buildBody[1] << 8));
-				_snprintf_s(g_buildFlashText, _TRUNCATE, "Applied %d bytes", written);
-				g_buildFlashError = false;
-				g_buildFlashUntil = (float)ImGui::GetTime() + 2.0f;
+
+				// Deliberately do NOT re-target g_buildArmedId from the new
+				// first two bytes. The armed id selects the vtable we replay
+				// under; silently following an edited id would send the
+				// message under a different class's vtable. Instead report
+				// the mismatch and let the user re-arm explicitly.
+				uint16_t bodyId = (written >= 2)
+					? (uint16_t)(g_buildBody[0] | (g_buildBody[1] << 8)) : 0;
+
+				if (bodyId != g_buildArmedId)
+				{
+					_snprintf_s(g_buildFlashText, _TRUNCATE,
+						"Applied %d bytes - body id 0x%04X differs from armed 0x%04X",
+						written, (unsigned)bodyId, (unsigned)g_buildArmedId);
+					g_buildFlashError = true;
+					g_buildFlashUntil = (float)ImGui::GetTime() + 4.0f;
+				}
+				else
+				{
+					_snprintf_s(g_buildFlashText, _TRUNCATE, "Applied %d bytes", written);
+					g_buildFlashError = false;
+					g_buildFlashUntil = (float)ImGui::GetTime() + 2.0f;
+				}
 			}
 			else
 			{

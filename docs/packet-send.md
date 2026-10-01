@@ -99,30 +99,56 @@ wire    2E 00 33 08 08 8E CB 52 38 F9 02 40 E2 01 48 90 ...
    recreates the socket on reconnect, so it is refreshed on every send rather
    than cached once.
 
-## Why the packet cannot be built from scratch
+## The captured body is fully valid protobuf
 
-The captured `0x0833` body is 42 bytes: nine clean protobuf varint fields, then
-a 13-byte tail that is **not** protobuf:
+The captured `0x0833` body is 43 bytes (the 2-byte id plus a 41-byte protobuf
+payload), and it parses cleanly from end to end as **ten varint fields** — no
+opaque tail:
 
 ```
-body+ 0  tag 0x08  field 1  = 1353102
-body+ 4  tag 0x38  field 7  = 377
-body+ 7  tag 0x40  field 8  = 226
-body+10  tag 0x48  field 9  = 6666000
-body+15  tag 0x60  field 12 = 137
-body+18  tag 0x68  field 13 = 0
-body+20  tag 0x70  field 14 = 378
-body+23  tag 0x78  field 15 = 216
-body+26  tag 0x88  field 17 = 1
-body+28  tag 0xFC  field 31  wiretype 4  <-- not a varint; parse stops here
-tail     fc 50 a0 01 ff ff ff ff ff ff ff ff ff 01   (14 bytes)
+body+ 2  tag 0x08     field  1 = 1353102
+body+ 6  tag 0x38     field  7 = 377
+body+ 9  tag 0x40     field  8 = 226
+body+12  tag 0x48     field  9 = 6666000
+body+17  tag 0x60     field 12 = 137
+body+20  tag 0x68     field 13 = 0
+body+22  tag 0x70     field 14 = 378
+body+25  tag 0x78     field 15 = 216
+body+28  tag 0x88 01  field 17 = 10364          (2-byte tag)
+body+32  tag 0xA0 01  field 20 = 0xFFFFFFFFFFFFFFFF  (2-byte tag)
+                              44 bytes consumed, 0 left over
 ```
 
-`0xFF` is not a legal protobuf tag, so the tail is either a different
-serialization or obfuscated. Since the field numbering also does not match
-other public Conquer clients' jump packets (which use contiguous fields 1–11
-with `mode = 19` in field 1), a synthetic body would be a guess. Replaying a
-real capture avoids the guess entirely.
+Two of those fields (17 and 20) are above field 15, so their **tag is a
+multi-byte varint**. That matters twice over:
+
+* a parser that reads a single tag byte mis-decodes them, and
+* an editor that assumes "value = tag + 1" writes into the tag's second byte.
+
+Both bugs were present in the first cut of the builder and are now fixed; the
+field walk decodes the tag as a varint and records the real value offset.
+
+Field 20's `0xFFFFFFFFFFFFFFFF` is a genuine all-ones `uint64` sentinel (most
+likely "no target"), not garbage — which is what made it look like an
+unparseable tail before the multi-byte tags were handled.
+
+Because the body is entirely protobuf, a synthetic rebuild is *technically*
+possible — but it would still be a guess about which fields the server
+validates, so the builder continues to replay a real capture.
+
+## The timestamp lead
+
+Field 9 of the captured packet holds a milliseconds value (6666000 ≈ 111
+minutes of client uptime) — the client's own clock. The reference packet
+builders advance such a field on every jump so the server sees a client that is
+legitimately moving "ahead", rather than a burst of identical timestamps.
+
+The builder applies this lead itself: *Map tab → Travel* exposes **Lead
+(ms/jump)** and the **lead field** number (default 9), and `TickJumpAutoFire`
+adds the lead to that field before each auto-jump. Setting the lead to 0, or
+the field to 0, disables the roll-forward and replays the capture verbatim.
+The field number is a setting rather than a hardcoded index because the
+timestamp field differs per packet shape and per client build.
 
 ## What the UI exposes
 
@@ -132,7 +158,7 @@ real capture avoids the guess entirely.
   highlighted in the table.
 * **Map tab → Travel.** The `Speedhack If No Players Nearby` checkbox from the
   original template now drives a real sender: a repeat interval, a per-jump
-  "lead" applied to the timestamp field, and an auto-jump toggle.
+  "lead" (with the field it applies to), and an auto-jump toggle.
 
 ## Caveats
 

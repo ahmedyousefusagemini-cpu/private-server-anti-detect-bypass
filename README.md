@@ -97,7 +97,10 @@ The panel can also **send** packets, not just read them. The Packets tab has a
    (optionally N times with a gap between them)
 
 The Map tab's **Travel** section drives the same sender: a repeat interval, a
-per-jump timestamp "lead", and an auto-jump toggle.
+per-jump timestamp "lead" (and which protobuf field it applies to, default 9),
+and an auto-jump toggle. The lead rolls the template's client-clock field
+forward by N ms per jump so the server does not see a burst of identical
+timestamps; set it to 0 to replay the capture byte-for-byte.
 
 A packet cannot be invented from scratch. `CMyClientSocket::DoSendMsg` calls a
 *virtual* `CMsg::GetSize()` through the message's vtable and refuses to send

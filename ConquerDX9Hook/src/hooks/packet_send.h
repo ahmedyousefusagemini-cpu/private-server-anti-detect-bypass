@@ -102,9 +102,12 @@ namespace PacketSend
 	//   0  success
 	//   4  the socket reported a send error
 	//  -1  we refused (no slot, no socket, or the message did not fit)
+	//  -2  the body's own id does not match the slot whose vtable we hold
 	//
 	// `bodyOverride` (optional) replaces the body for this send only; pass
-	// nullptr to use exactly what is stored in the slot.
+	// nullptr to use exactly what is stored in the slot. The override MUST
+	// begin with the same 2-byte id the slot was captured under - see the
+	// `-2` case above.
 	int SendSlot(uint16_t messageId, const uint8_t* bodyOverride, int bodyOverrideBytes);
 
 	// Number of sends this module has issued (for the UI).

@@ -112,6 +112,9 @@
     <ClCompile Include="src\hooks\packet_capture.cpp">
       <Filter>Source Files\hooks</Filter>
     </ClCompile>
+    <ClCompile Include="src\hooks\packet_send.cpp">
+      <Filter>Source Files\hooks</Filter>
+    </ClCompile>
     <ClCompile Include="src\hooks\packet_overlay.cpp">
       <Filter>Source Files\hooks</Filter>
     </ClCompile>
