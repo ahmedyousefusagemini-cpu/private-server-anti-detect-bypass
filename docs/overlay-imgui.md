@@ -95,8 +95,44 @@ FPS: 128.4
 
 The packet logger lives in the **Packets** tab (the shell opens on it by
 default). It shows a toolbar (`CAPTURING`/`PAUSED` + SEND/RECV/dropped totals),
-the live 7-column capture table (`# / TIME / DIR / LEN / ID / MESSAGE / BYTES`),
-the hex/ASCII dump of the selected packet, and a status bar.
+a **filter bar**, the live 7-column capture table
+(`# / TIME / DIR / LEN / ID / MESSAGE / BYTES`), the hex/ASCII dump of the
+selected packet, and a status bar.
+
+### Filtering
+
+Every clause is ANDed, and a clause left at its neutral value is not applied —
+so an untouched filter bar shows the whole ring. The master `Filter` checkbox
+turns the whole bar on and off.
+
+| control | matches |
+|---------|---------|
+| search box | substring of the name, `CMsg` class, meaning, or `0xNNNN` id |
+| `Aa` | make the search box case-sensitive |
+| id box | `0x0800` / `0800h` (hex) or `2048` (decimal) exact id; append `*` for a prefix (`0x07*`); anything else is a substring match |
+| class box | substring of the `CMsg` class name |
+| class combo | quick-pick from the classes actually present in the current capture |
+| direction combo | `Any dir` / `SEND` / `RECV` |
+| `Known only` | hide ids with no recovered name or class |
+| from / to | seconds since capture start; `0` means unbounded |
+
+`Copy N rows` copies every visible row to the clipboard as TSV (with a header
+row, and `class` / `meaning` columns). `Copy hex` copies the selected packet's
+hex dump plus a `#`-comment header. `Reset` clears the whole bar.
+
+### Settings
+
+The `Save Settings` button writes the filter state and selected tab to
+**`overlay.ini`** next to the game exe. The panel also autosaves ~1.5 s after
+the last change (that is what "Autosaves shortly after changes" refers to), and
+reads the file back on the first frame.
+
+### Catalogue metadata
+
+Beyond the id → name map, `packet_names.h` now carries, per id: the `CMsg`
+class name, the recorded direction and a one-line meaning. All of it is
+generated from the same TSVs by `tools/gen_names.py`, so filtering by class or
+meaning works for anything the catalogue knows about.
 
 The other tabs are presentational shells for now:
 

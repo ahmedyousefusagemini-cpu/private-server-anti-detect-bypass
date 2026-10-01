@@ -58,6 +58,25 @@ lives in the **Packets** tab, which the panel opens on by default.
 | `Misc`    | interface toggles + diagnostics |
 | `Plugins` | plugin list placeholder |
 
+### Filtering the packet list
+
+The Packets tab has a filter bar above the table. Every clause is ANDed and a
+clause at its default is ignored:
+
+- **search** — substring of the name, `CMsg` class, meaning or `0xNNNN` id
+  (`Aa` makes it case-sensitive)
+- **id** — `0x0800` / `0800h` / `2048` for an exact id, `0x07*` for a prefix
+- **class** — substring of the `CMsg` class, with a quick-pick combo built from
+  the classes present in the current capture
+- **direction** — `Any dir` / `SEND` / `RECV`
+- **Known only** — hide ids with no recovered name or class
+- **from / to** — a window in seconds since capture start (`0` = unbounded)
+
+`Copy N rows` puts every visible row on the clipboard as TSV; `Copy hex` copies
+the selected packet's hex dump; `Reset` clears the bar. The `Save Settings`
+button (and a ~1.5 s autosave) persists the filter and selected tab to
+`overlay.ini` next to the game exe.
+
 SEND rows are amber, RECV rows are green. The **MESSAGE** column is the
 human-readable name recovered from the client's own dispatch table (see
 [docs/packet-catalog.md](docs/packet-catalog.md)); unknown ids fall back to

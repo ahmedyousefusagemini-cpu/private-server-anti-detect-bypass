@@ -29,6 +29,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <cctype>
 #include <cfloat>
 
 #include "imgui.h"
@@ -99,6 +100,39 @@ namespace {
 	float g_colId = 68.0f;
 	float g_colName = 172.0f;
 
+	// ---- filter state -----------------------------------------------------
+	// A row is shown when it passes every active clause. Clauses that are
+	// left at their neutral value are not applied at all, so an untouched
+	// filter bar shows the full ring.
+	char  g_filterText[128] = "";        // free text: id (hex or dec), name, class, meaning
+	char  g_filterId[32] = "";           // id only: "0x0800", "2048", "0x07*" (prefix ok)
+	char  g_filterClass[64] = "";        // substring of the CMsg class name
+	int   g_filterDirection = 0;         // 0=any 1=SEND 2=RECV
+	bool  g_filterAnnotatedOnly = false; // hide ids with no name/class recovered
+	float g_filterFromSeconds = 0.0f;    // include packets at/after this age (0 = all)
+	float g_filterToSeconds = 0.0f;      // include packets at/before this age (0 = all)
+	bool  g_filterTextCase = false;      // case sensitive free text
+	bool  g_filterEnabled = false;       // master switch (the "Filter" checkbox)
+
+	// Distinct class names seen in the current capture, rebuilt each frame
+	// from the ring so the combo only lists things actually present. Capped
+	// because a full ring can hold hundreds of distinct ids.
+	const int kMaxClassChoices = 64;
+	char  g_classChoices[kMaxClassChoices][64] = {};
+	int   g_classChoiceCount = 0;
+
+	// Copy feedback: shows a transient "Copied N rows" note.
+	float g_copyFlashUntil = 0.0f;
+	char  g_copyFlashText[64] = "";
+
+	// Autosave: the "Autosaves shortly after changes" note next to the Save
+	// Settings button is not decorative - the panel writes overlay.ini once
+	// the state has been stable for a moment, so a crash or forced exit does
+	// not lose the filter setup.
+	bool  g_settingsDirty = false;
+	float g_settingsDirtySince = 0.0f;
+	const float kAutosaveDelay = 1.5f;         // seconds of quiet before writing
+
 	const float kDetailHeight = 150.0f;
 	const float kPanelWidth = 1080.0f;
 	const float kPanelHeight = 660.0f;
@@ -128,16 +162,21 @@ namespace {
 	// "08 00 23 04 4A 33 03 5B", truncated to maxBytes.
 	void BuildHexPreview(const Entry& entry, char* out, size_t outSize, size_t maxBytes)
 	{
+		if (outSize == 0) return;
+		out[0] = '\0';
+		if (maxBytes == 0) return;
+
 		size_t bytes = (size_t)entry.storedBytes;
 		if (bytes > maxBytes) bytes = maxBytes;
 
 		size_t written = 0;
 		for (size_t i = 0; i < bytes && written + 4 < outSize; ++i)
 		{
-			written += (size_t)_snprintf_s(out + written, outSize - written, _TRUNCATE,
+			int added = _snprintf_s(out + written, outSize - written, _TRUNCATE,
 				(i + 1 < bytes) ? "%02X " : "%02X", entry.data[i]);
+			if (added <= 0) break;      // -1 on truncation; buffer is terminated
+			written += (size_t)added;
 		}
-		if (written == 0) out[0] = '\0';
 	}
 
 	void FormatAscii(const uint8_t* data, int bytes, char* out, size_t outSize)
@@ -149,6 +188,313 @@ namespace {
 			out[written++] = (c >= 0x20 && c < 0x7F) ? (char)c : '.';
 		}
 		out[written] = '\0';
+	}
+
+	// -----------------------------------------------------------------------
+	// Filtering
+	// -----------------------------------------------------------------------
+	bool ContainsFold(const char* haystack, const char* needle, bool caseSensitive)
+	{
+		if (!needle || !*needle) return true;
+		if (!haystack) return false;
+		if (caseSensitive) return strstr(haystack, needle) != nullptr;
+
+		// Case-insensitive substring search, ASCII only (all our metadata is
+		// ASCII). Walks the source once per start position.
+		size_t needleLen = strlen(needle);
+		for (const char* p = haystack; *p; ++p)
+		{
+			size_t i = 0;
+			while (i < needleLen && p[i]
+				&& (char)tolower((unsigned char)p[i]) == (char)tolower((unsigned char)needle[i]))
+			{
+				++i;
+			}
+			if (i == needleLen) return true;
+		}
+		return false;
+	}
+
+	// Parses an id filter. Accepts:
+	//   "0x0800" / "0800h"   hex
+	//   "2048"               decimal
+	//   "0x07*"              hex prefix
+	// Returns false when the text is not a usable id pattern (caller then
+	// treats it as a plain substring of the formatted hex/dec forms).
+	bool ParseIdFilter(const char* text, unsigned& value, bool& prefixOnly,
+		bool& isHex, size_t& digitCount)
+	{
+		if (!text || !*text) return false;
+
+		char buf[32];
+		strncpy_s(buf, sizeof(buf), text, _TRUNCATE);
+		char* p = buf;
+
+		isHex = false;
+		if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) { isHex = true; p += 2; }
+		else
+		{
+			size_t len = strlen(p);
+			if (len > 1 && (p[len - 1] == 'h' || p[len - 1] == 'H'))
+			{
+				isHex = true;
+				p[len - 1] = '\0';
+			}
+		}
+
+		prefixOnly = false;
+		size_t len = strlen(p);
+		if (len && p[len - 1] == '*')
+		{
+			prefixOnly = true;
+			p[--len] = '\0';
+		}
+
+		if (len == 0 || len > 8) return false;
+
+		unsigned parsed = 0;
+		for (size_t i = 0; i < len; ++i)
+		{
+			char c = p[i];
+			unsigned digit;
+			if (isHex)
+			{
+				if (c >= '0' && c <= '9') digit = (unsigned)(c - '0');
+				else if (c >= 'a' && c <= 'f') digit = (unsigned)(c - 'a' + 10);
+				else if (c >= 'A' && c <= 'F') digit = (unsigned)(c - 'A' + 10);
+				else return false;
+				parsed = parsed * 16u + digit;
+			}
+			else
+			{
+				if (c < '0' || c > '9') return false;
+				parsed = parsed * 10u + (unsigned)(c - '0');
+			}
+		}
+
+		value = parsed;
+		digitCount = len;
+		return true;
+	}
+
+	// True when the packet's age (seconds since capture start) is inside the
+	// configured window. A 0 for either bound means "unbounded".
+	bool PassesTimeFilter(const Entry& entry)
+	{
+		if (g_filterFromSeconds <= 0.0f && g_filterToSeconds <= 0.0f) return true;
+
+		float age = (float)(entry.tick - g_startTick) / 1000.0f;
+		if (g_filterFromSeconds > 0.0f && age < g_filterFromSeconds) return false;
+		if (g_filterToSeconds > 0.0f && age > g_filterToSeconds) return false;
+		return true;
+	}
+
+	bool PassesFilters(const Entry& entry)
+	{
+		if (!g_filterEnabled) return true;
+		if (!PassesTimeFilter(entry)) return false;
+
+		// Direction: SEND is 0, RECV is 1 in the capture; the combo uses
+		// 0=any, 1=SEND, 2=RECV.
+		if (g_filterDirection == 1 && entry.direction != DirectionSend) return false;
+		if (g_filterDirection == 2 && entry.direction != DirectionRecv) return false;
+
+		const char* name = PacketNames::Lookup(entry.messageId);
+		const char* cls = PacketNames::ClassName(entry.messageId);
+		const char* meaning = PacketNames::Meaning(entry.messageId);
+
+		if (g_filterAnnotatedOnly)
+		{
+			bool known = (cls && *cls) || (meaning && *meaning);
+			if (!known) return false;
+		}
+
+		if (g_filterClass[0] && !ContainsFold(cls, g_filterClass, false)) return false;
+
+		if (g_filterId[0])
+		{
+			unsigned value = 0;
+			bool prefixOnly = false, isHex = false;
+			size_t digits = 0;
+			bool matches = false;
+
+			if (ParseIdFilter(g_filterId, value, prefixOnly, isHex, digits))
+			{
+				unsigned id = entry.messageId;
+				if (prefixOnly && isHex)
+				{
+					// Hex prefix: compare the top `digits` nibbles.
+					unsigned shift = (unsigned)(4u * digits);
+					matches = (shift >= 32u) || ((id >> shift) == value);
+				}
+				else if (prefixOnly)
+				{
+					// Decimal prefix: compare the top `digits` decimal digits.
+					unsigned scale = 1u;
+					for (size_t d = 0; d < digits && scale != 0; ++d) scale *= 10u;
+					matches = (scale == 0) || ((id / scale) == value);
+				}
+				else
+				{
+					matches = (id == value);
+				}
+			}
+			else
+			{
+				// Not a numeric pattern - substring match on both spellings.
+				char hex[16], dec[16];
+				_snprintf_s(hex, _TRUNCATE, "0x%04X", (unsigned)entry.messageId);
+				_snprintf_s(dec, _TRUNCATE, "%u", (unsigned)entry.messageId);
+				matches = ContainsFold(hex, g_filterId, false) ||
+					ContainsFold(dec, g_filterId, false);
+			}
+
+			if (!matches) return false;
+		}
+
+		if (g_filterText[0])
+		{
+			char idHex[16];
+			_snprintf_s(idHex, _TRUNCATE, "0x%04X", (unsigned)entry.messageId);
+			if (!ContainsFold(name, g_filterText, g_filterTextCase) &&
+				!ContainsFold(cls, g_filterText, g_filterTextCase) &&
+				!ContainsFold(meaning, g_filterText, g_filterTextCase) &&
+				!ContainsFold(idHex, g_filterText, g_filterTextCase))
+				return false;
+		}
+
+		return true;
+	}
+
+	// Rebuilds the class-name combo choices from the packets currently in the
+	// ring, so the list reflects what the session actually contains.
+	void RebuildClassChoices(const Snapshot& snapshot)
+	{
+		g_classChoiceCount = 0;
+		long count = snapshot.count;
+		for (long i = 0; i < count && g_classChoiceCount < kMaxClassChoices; ++i)
+		{
+			long index = (snapshot.head - count + i + kRingSize * 2) % kRingSize;
+			const char* cls = PacketNames::ClassName(snapshot.ring[index].messageId);
+			if (!cls || !*cls) continue;
+
+			bool seen = false;
+			for (int c = 0; c < g_classChoiceCount; ++c)
+			{
+				if (strcmp(g_classChoices[c], cls) == 0) { seen = true; break; }
+			}
+			if (seen) continue;
+
+			strncpy_s(g_classChoices[g_classChoiceCount], sizeof(g_classChoices[0]), cls, _TRUNCATE);
+			++g_classChoiceCount;
+		}
+	}
+
+	// -----------------------------------------------------------------------
+	// Settings persistence (overlay.ini, next to the game exe)
+	// -----------------------------------------------------------------------
+	// The panel's own layout and filter state are kept separate from
+	// packet_log.ini (which the capture layer owns): a "Save Settings" click
+	// writes this file, and it is read back once on the first frame.
+	void OverlayIniPath(char* out, size_t outSize)
+	{
+		out[0] = '\0';
+		char exePath[MAX_PATH] = { 0 };
+		if (!GetModuleFileNameA(NULL, exePath, MAX_PATH)) return;
+		char* slash = strrchr(exePath, '\\');
+		if (slash) *(slash + 1) = '\0';
+		_snprintf_s(out, outSize, _TRUNCATE, "%soverlay.ini", exePath);
+	}
+
+	void SaveOverlaySettings()
+	{
+		char path[MAX_PATH];
+		OverlayIniPath(path, sizeof(path));
+		if (!path[0]) return;
+
+		FILE* f = nullptr;
+		if (fopen_s(&f, path, "w") != 0 || !f) return;
+
+		fprintf(f, "; Manager overlay - written by the Save Settings button\r\n");
+		fprintf(f, "filter_enabled=%d\r\n", g_filterEnabled ? 1 : 0);
+		fprintf(f, "filter_text=%s\r\n", g_filterText);
+		fprintf(f, "filter_id=%s\r\n", g_filterId);
+		fprintf(f, "filter_class=%s\r\n", g_filterClass);
+		fprintf(f, "filter_direction=%d\r\n", g_filterDirection);
+		fprintf(f, "filter_known_only=%d\r\n", g_filterAnnotatedOnly ? 1 : 0);
+		fprintf(f, "filter_case=%d\r\n", g_filterTextCase ? 1 : 0);
+		fprintf(f, "filter_from=%.2f\r\n", g_filterFromSeconds);
+		fprintf(f, "filter_to=%.2f\r\n", g_filterToSeconds);
+		fprintf(f, "tab=%d\r\n", g_activeTab);
+		fclose(f);
+	}
+
+	bool LoadOverlaySettings()
+	{
+		char path[MAX_PATH];
+		OverlayIniPath(path, sizeof(path));
+		if (!path[0]) return false;
+
+		FILE* f = nullptr;
+		if (fopen_s(&f, path, "r") != 0 || !f) return false;
+
+		char line[512];
+		while (fgets(line, sizeof(line), f))
+		{
+			if (line[0] == ';' || line[0] == '#' || line[0] == '\r' || line[0] == '\n') continue;
+			char* equals = strchr(line, '=');
+			if (!equals) continue;
+			*equals = '\0';
+			const char* key = line;
+			char* value = equals + 1;
+
+			// Trim the trailing newline the fgets kept.
+			size_t vlen = strlen(value);
+			while (vlen && (value[vlen - 1] == '\n' || value[vlen - 1] == '\r'))
+				value[--vlen] = '\0';
+
+			// Case-insensitive key compare.
+			if (_stricmp(key, "filter_enabled") == 0) g_filterEnabled = (atoi(value) != 0);
+			else if (_stricmp(key, "filter_text") == 0) strncpy_s(g_filterText, sizeof(g_filterText), value, _TRUNCATE);
+			else if (_stricmp(key, "filter_id") == 0) strncpy_s(g_filterId, sizeof(g_filterId), value, _TRUNCATE);
+			else if (_stricmp(key, "filter_class") == 0) strncpy_s(g_filterClass, sizeof(g_filterClass), value, _TRUNCATE);
+			else if (_stricmp(key, "filter_direction") == 0) g_filterDirection = atoi(value);
+			else if (_stricmp(key, "filter_known_only") == 0) g_filterAnnotatedOnly = (atoi(value) != 0);
+			else if (_stricmp(key, "filter_case") == 0) g_filterTextCase = (atoi(value) != 0);
+			else if (_stricmp(key, "filter_from") == 0) g_filterFromSeconds = (float)atof(value);
+			else if (_stricmp(key, "filter_to") == 0) g_filterToSeconds = (float)atof(value);
+			else if (_stricmp(key, "tab") == 0)
+			{
+				int tab = atoi(value);
+				if (tab < 0) tab = 0;
+				if (tab > 4) tab = 4;
+				g_activeTab = tab;
+				g_requestedTab = tab;
+			}
+		}
+		fclose(f);
+
+		if (g_filterDirection < 0) g_filterDirection = 0;
+		if (g_filterDirection > 2) g_filterDirection = 2;
+		return true;
+	}
+
+	// Records that the panel state changed; TickAutosave() flushes it once the
+	// user has stopped fiddling.
+	void MarkSettingsDirty()
+	{
+		g_settingsDirty = true;
+		g_settingsDirtySince = (float)ImGui::GetTime();
+	}
+
+	// Called once per frame while the panel is open. Writes overlay.ini after
+	// kAutosaveDelay seconds without a further change.
+	void TickAutosave()
+	{
+		if (!g_settingsDirty) return;
+		if (ImGui::GetTime() - g_settingsDirtySince < kAutosaveDelay) return;
+		SaveOverlaySettings();
+		g_settingsDirty = false;
 	}
 
 	// Small dimmed caption used for the "Autosaves shortly after changes" note
@@ -185,6 +531,7 @@ namespace {
 
 		if (ImGui::Button("Save Settings", ImVec2(120.0f, 0.0f)))
 		{
+			SaveOverlaySettings();
 			g_saveSettingsPressed = true;
 			g_saveFlashUntil = (float)ImGui::GetTime() + 2.0f;
 		}
@@ -319,6 +666,303 @@ namespace {
 	// -----------------------------------------------------------------------
 	// Tab: Packets  (the actual logger)
 	// -----------------------------------------------------------------------
+	// Number of rows in the ring that pass the active filter.
+	long CountFiltered(const Snapshot& snapshot)
+	{
+		long shown = 0;
+		long count = snapshot.count;
+		for (long i = 0; i < count; ++i)
+		{
+			long index = (snapshot.head - count + i + kRingSize * 2) % kRingSize;
+			if (PassesFilters(snapshot.ring[index])) ++shown;
+		}
+		return shown;
+	}
+
+	// Appends one TSV row for the packet.
+	void AppendTsvRow(char* out, size_t outSize, const Entry& entry)
+	{
+		char clock[32];
+		FormatClock(entry.tick, clock, sizeof(clock));
+
+		char preview[512];
+		BuildHexPreview(entry, preview, sizeof(preview), entry.storedBytes);
+
+		size_t used = strlen(out);
+		_snprintf_s(out + used, outSize - used, _TRUNCATE,
+			"%06u\t%s\t%s\t%u\t0x%04X\t%s\t%s\t%s\t%s\n",
+			entry.seq, clock,
+			entry.direction == DirectionSend ? "SEND" : "RECV",
+			(unsigned)entry.length, (unsigned)entry.messageId,
+			PacketNames::Lookup(entry.messageId),
+			PacketNames::ClassName(entry.messageId),
+			PacketNames::Meaning(entry.messageId),
+			preview);
+	}
+
+	// Copies every row that passes the filter, as TSV, to the clipboard.
+	// Returns the number of rows written.
+	long CopyFilteredRows(const Snapshot& snapshot)
+	{
+		// Worst case per row (id + ~1000 hex bytes + metadata) with slack.
+		size_t capacity = (size_t)snapshot.count * 1280 + 512;
+		char* buffer = (char*)malloc(capacity);
+		if (!buffer) return 0;
+		buffer[0] = '\0';
+
+		// Header row so the paste is self-describing.
+		strncpy_s(buffer, capacity,
+			"seq\ttime\tdir\tlen\tid\tname\tclass\tmeaning\tbytes\n", _TRUNCATE);
+
+		long written = 0;
+		long count = snapshot.count;
+		for (long i = 0; i < count; ++i)
+		{
+			long index = (snapshot.head - count + i + kRingSize * 2) % kRingSize;
+			const Entry& entry = snapshot.ring[index];
+			if (!PassesFilters(entry)) continue;
+			if (strlen(buffer) + 1400 >= capacity) break;   // never overflow
+			AppendTsvRow(buffer, capacity, entry);
+			++written;
+		}
+
+		ImGui::SetClipboardText(buffer);
+		free(buffer);
+		return written;
+	}
+
+	// Copies just the selected packet's hex dump (classic "xxd"-ish layout).
+	bool CopySelectedHex(const Snapshot& snapshot)
+	{
+		const Entry* entry = nullptr;
+		if (g_hasSelection)
+		{
+			long index = IndexOfSeq(snapshot, g_selectedSeq);
+			if (index >= 0) entry = &snapshot.ring[index];
+		}
+		if (!entry) return false;
+
+		size_t capacity = (size_t)entry->storedBytes * 5 + 256;
+		char* buffer = (char*)malloc(capacity);
+		if (!buffer) return false;
+		buffer[0] = '\0';
+
+		char clock[32];
+		FormatClock(entry->tick, clock, sizeof(clock));
+		strncat_s(buffer, capacity, "# Conquer packet\n", _TRUNCATE);
+		char header[256];
+		_snprintf_s(header, _TRUNCATE,
+			"# seq=%u time=%s dir=%s len=%u id=0x%04X name=%s class=%s\n",
+			entry->seq, clock,
+			entry->direction == DirectionSend ? "SEND" : "RECV",
+			(unsigned)entry->length, (unsigned)entry->messageId,
+			PacketNames::Lookup(entry->messageId),
+			PacketNames::ClassName(entry->messageId));
+		strncat_s(buffer, capacity, header, _TRUNCATE);
+
+		int bytes = entry->storedBytes;
+		for (int offset = 0; offset < bytes; offset += kBytesPerRow)
+		{
+			char line[256];
+			size_t written = (size_t)_snprintf_s(line, _TRUNCATE, "%04X  ", offset);
+			for (int i = 0; i < kBytesPerRow; ++i)
+			{
+				if (offset + i < bytes)
+					written += (size_t)_snprintf_s(line + written, sizeof(line) - written, _TRUNCATE,
+						"%02X ", entry->data[offset + i]);
+				else
+					written += (size_t)_snprintf_s(line + written, sizeof(line) - written, _TRUNCATE, "   ");
+				if (i == 7 && written + 2 < sizeof(line))
+				{
+					line[written++] = ' ';
+					line[written] = '\0';
+				}
+			}
+			int asciiBytes = bytes - offset;
+			if (asciiBytes > kBytesPerRow) asciiBytes = kBytesPerRow;
+			char ascii[32];
+			FormatAscii(entry->data + offset, asciiBytes, ascii, sizeof(ascii));
+			_snprintf_s(line + written, sizeof(line) - written, _TRUNCATE, " |%s|\n", ascii);
+			strncat_s(buffer, capacity, line, _TRUNCATE);
+		}
+
+		ImGui::SetClipboardText(buffer);
+		free(buffer);
+		return true;
+	}
+
+	void FlashCopied(const char* what, long count)
+	{
+		g_copyFlashUntil = (float)ImGui::GetTime() + 2.0f;
+		if (count >= 0)
+			_snprintf_s(g_copyFlashText, _TRUNCATE, "Copied %ld %s", count, what);
+		else
+			_snprintf_s(g_copyFlashText, _TRUNCATE, "%s", what);
+	}
+
+	bool AnyFilterActive()
+	{
+		return g_filterText[0] || g_filterId[0] || g_filterClass[0] ||
+			g_filterDirection != 0 || g_filterAnnotatedOnly ||
+			g_filterFromSeconds > 0.0f || g_filterToSeconds > 0.0f;
+	}
+
+	void ResetFilters()
+	{
+		g_filterText[0] = '\0';
+		g_filterId[0] = '\0';
+		g_filterClass[0] = '\0';
+		g_filterDirection = 0;
+		g_filterAnnotatedOnly = false;
+		g_filterFromSeconds = 0.0f;
+		g_filterToSeconds = 0.0f;
+		g_filterEnabled = false;
+	}
+
+	// Cheap fingerprint of everything the autosave persists. When it changes,
+	// the state is marked dirty; comparing strings avoids threading change
+	// notifications through every widget.
+	void NoteFilterChanges()
+	{
+		static char last[512] = "";
+		char now[512];
+		_snprintf_s(now, _TRUNCATE, "%d|%s|%s|%s|%d|%d|%d|%.2f|%.2f|%d",
+			g_filterEnabled ? 1 : 0, g_filterText, g_filterId, g_filterClass,
+			g_filterDirection, g_filterAnnotatedOnly ? 1 : 0, g_filterTextCase ? 1 : 0,
+			g_filterFromSeconds, g_filterToSeconds, g_activeTab);
+
+		if (strcmp(now, last) != 0)
+		{
+			strncpy_s(last, sizeof(last), now, _TRUNCATE);
+			MarkSettingsDirty();
+		}
+	}
+
+	// The filter row above the table. Keeps the ring lock held by the caller.
+	void DrawFilterBar(const Snapshot& snapshot, float windowWidth)
+	{
+		ImGui::Checkbox("Filter", &g_filterEnabled);
+		ImGui::SameLine();
+
+		// Free text covers name / class / meaning / id at once.
+		ImGui::SetNextItemWidth(240.0f);
+		ImGui::InputTextWithHint("##filtertext", "search name, class, meaning, id...",
+			g_filterText, sizeof(g_filterText));
+		ImGui::SameLine();
+		ImGui::Checkbox("Aa", &g_filterTextCase);
+		if (ImGui::IsItemHovered()) ImGui::SetTooltip("Case sensitive");
+
+		ImGui::SameLine();
+		ImGui::TextDisabled("|");
+		ImGui::SameLine();
+
+		// Id box: exact, hex, or a prefix with a trailing '*'.
+		ImGui::SetNextItemWidth(96.0f);
+		ImGui::InputTextWithHint("##filterid", "id 0x07*", g_filterId, sizeof(g_filterId));
+		if (ImGui::IsItemHovered())
+			ImGui::SetTooltip("0x0800 or 2048 for an exact id; 0x07* or 07* for a prefix");
+
+		ImGui::SameLine();
+		ImGui::SetNextItemWidth(150.0f);
+		ImGui::InputTextWithHint("##filterclass", "class CMsg...", g_filterClass, sizeof(g_filterClass));
+
+		ImGui::SameLine();
+		static const char* directions[] = { "Any dir", "SEND", "RECV" };
+		ImGui::SetNextItemWidth(96.0f);
+		ImGui::Combo("##filterdir", &g_filterDirection, directions, IM_COUNTOF(directions));
+
+		ImGui::SameLine();
+		ImGui::Checkbox("Known only", &g_filterAnnotatedOnly);
+		if (ImGui::IsItemHovered())
+			ImGui::SetTooltip("Hide ids with no recovered name/class");
+
+		// Time window, in seconds since capture start (0 = unbounded).
+		ImGui::SameLine();
+		ImGui::TextDisabled("|");
+		ImGui::SameLine();
+		ImGui::SetNextItemWidth(74.0f);
+		ImGui::InputFloat("##from", &g_filterFromSeconds, 0.0f, 0.0f, "%.0f");
+		if (ImGui::IsItemHovered()) ImGui::SetTooltip("From second (0 = start)");
+		ImGui::SameLine();
+		ImGui::TextDisabled("to");
+		ImGui::SameLine();
+		ImGui::SetNextItemWidth(74.0f);
+		ImGui::InputFloat("##to", &g_filterToSeconds, 0.0f, 0.0f, "%.0f");
+		if (ImGui::IsItemHovered()) ImGui::SetTooltip("To second (0 = now)");
+		if (g_filterFromSeconds < 0.0f) g_filterFromSeconds = 0.0f;
+		if (g_filterToSeconds < 0.0f) g_filterToSeconds = 0.0f;
+
+		// Class quick-pick, populated from the ring.
+		if (g_classChoiceCount > 0)
+		{
+			ImGui::SameLine();
+			ImGui::SetNextItemWidth(190.0f);
+			if (ImGui::BeginCombo("##classpick", "pick class...", ImGuiComboFlags_HeightSmall))
+			{
+				for (int c = 0; c < g_classChoiceCount; ++c)
+				{
+					bool selected = (strcmp(g_classChoices[c], g_filterClass) == 0);
+					if (ImGui::Selectable(g_classChoices[c], selected))
+						strncpy_s(g_filterClass, sizeof(g_filterClass), g_classChoices[c], _TRUNCATE);
+					if (selected) ImGui::SetItemDefaultFocus();
+				}
+				ImGui::EndCombo();
+			}
+		}
+
+		// Copy + reset on the right.
+		long shown = CountFiltered(snapshot);
+		char copyLabel[48];
+		_snprintf_s(copyLabel, _TRUNCATE, "Copy %ld rows", shown);
+
+		const char* resetLabel = "Reset";
+		float rowWidth = ImGui::CalcTextSize(copyLabel).x + ImGui::CalcTextSize(resetLabel).x
+			+ ImGui::GetStyle().FramePadding.x * 8.0f
+			+ ImGui::CalcTextSize("| Copy all").x + 48.0f;
+		float x = windowWidth - rowWidth - ImGui::GetStyle().WindowPadding.x;
+		if (x > ImGui::GetCursorPosX())
+		{
+			ImGui::SameLine(x);
+
+			if (ImGui::Button(copyLabel))
+				FlashCopied("rows to clipboard", CopyFilteredRows(snapshot));
+			if (ImGui::IsItemHovered())
+				ImGui::SetTooltip("Copy every visible row as TSV");
+
+			ImGui::SameLine();
+			if (ImGui::Button("Reset"))
+				ResetFilters();
+
+			ImGui::SameLine();
+			ImGui::BeginDisabled(!g_hasSelection);
+			if (ImGui::Button("Copy hex"))
+			{
+				if (CopySelectedHex(snapshot))
+					FlashCopied("selected packet's hex to clipboard", -1);
+			}
+			if (ImGui::IsItemHovered())
+				ImGui::SetTooltip("Copy the selected packet's hex dump");
+			ImGui::EndDisabled();
+		}
+
+		// Feedback line.
+		if (g_copyFlashUntil > 0.0f && ImGui::GetTime() < g_copyFlashUntil)
+		{
+			ImGui::TextColored(ImVec4(0.45f, 0.90f, 0.55f, 1.0f), "%s", g_copyFlashText);
+		}
+		else if (AnyFilterActive())
+		{
+			ImGui::TextDisabled("filter active: %ld of %ld retained rows match",
+				shown, snapshot.count);
+		}
+		else
+		{
+			ImGui::TextDisabled("all %ld retained rows shown", snapshot.count);
+		}
+
+		ImGui::Separator();
+	}
+
 	void DrawPacketToolbar(float windowWidth)
 	{
 		// Capture state + totals on the left, capture controls on the right.
@@ -348,9 +992,20 @@ namespace {
 	void DrawPacketStatusBar(const Snapshot& snapshot)
 	{
 		ImGui::Separator();
-		ImGui::TextDisabled("showing %ld of %ld retained  |  %s  |  click a row for the hex dump",
-			snapshot.count, (long)snapshot.total,
-			g_autoScroll ? "following newest" : "scroll paused");
+
+		long shown = CountFiltered(snapshot);
+		if (AnyFilterActive())
+		{
+			ImGui::TextDisabled("filtered %ld of %ld retained  |  %s  |  click a row for the hex dump",
+				shown, snapshot.count,
+				g_autoScroll ? "following newest" : "scroll paused");
+		}
+		else
+		{
+			ImGui::TextDisabled("showing %ld of %ld retained  |  %s  |  click a row for the hex dump",
+				shown, snapshot.count,
+				g_autoScroll ? "following newest" : "scroll paused");
+		}
 	}
 
 	void DrawDetailPane(const Snapshot& snapshot)
@@ -385,6 +1040,25 @@ namespace {
 			ImGui::SameLine();
 			ImGui::TextDisabled("(%u of %u bytes stored)",
 				(unsigned)entry->storedBytes, (unsigned)entry->length);
+		}
+
+		// Class + meaning, when the catalogue knows them. The class is the
+		// CMsg type the client dispatch table maps this id to; the meaning is
+		// the curated one-liner.
+		const char* cls = PacketNames::ClassName(entry->messageId);
+		const char* meaning = PacketNames::Meaning(entry->messageId);
+		if ((cls && *cls) || (meaning && *meaning))
+		{
+			if (cls && *cls)
+			{
+				ImGui::TextDisabled("class:");
+				ImGui::SameLine();
+				ImGui::TextColored(ImVec4(0.62f, 0.78f, 1.0f, 1.0f), "%s", cls);
+			}
+			if (meaning && *meaning)
+			{
+				ImGui::TextWrapped("%s", meaning);
+			}
 		}
 
 		ImGui::TextDisabled("protobuf body follows the 4-byte header (len, id):");
@@ -455,6 +1129,12 @@ namespace {
 			long index = (snapshot.head - count + i + kRingSize * 2) % kRingSize;
 			const Entry& entry = snapshot.ring[index];
 
+			// Filtered-out rows are skipped entirely: submitting them keeps
+			// the scroll range honest but costs the row height, so we simply
+			// do not emit a row for them.
+			if (!PassesFilters(entry))
+				continue;
+
 			ImGui::TableNextRow();
 
 			const bool selected = g_hasSelection && entry.seq == g_selectedSeq;
@@ -522,14 +1202,19 @@ namespace {
 		float windowWidth = ImGui::GetWindowWidth();
 		DrawPacketToolbar(windowWidth);
 
+		// Class quick-pick choices reflect what this session has actually seen.
+		RebuildClassChoices(snapshot);
+		DrawFilterBar(snapshot, windowWidth);
+
 		// Reserve room for the status bar and the detail pane, then let the
-		// table take whatever remains.
+		// table take whatever remains. The detail pane may add up to two extra
+		// lines (class + wrapped meaning) on top of the fixed hex height.
 		float reserved = ImGui::GetTextLineHeightWithSpacing()          // status bar
 			+ kDetailHeight
-			+ ImGui::GetTextLineHeightWithSpacing()                    // "protobuf body" caption
+			+ ImGui::GetTextLineHeightWithSpacing() * 3.0f             // "protobuf body" caption + class/meaning
 			+ ImGui::GetFrameHeightWithSpacing()                       // hex child border/margins
-			+ ImGui::GetStyle().ItemSpacing.y * 6.0f
-			+ ImGui::GetStyle().FramePadding.y * 2.0f;
+			+ ImGui::GetStyle().ItemSpacing.y * 12.0f
+			+ ImGui::GetStyle().FramePadding.y * 4.0f;
 
 		float listHeight = ImGui::GetContentRegionAvail().y - reserved;
 		if (listHeight < 80.0f) listHeight = 80.0f;
@@ -667,6 +1352,10 @@ namespace {
 
 				ImGui::EndTabBar();
 			}
+
+			// Persist filter/tab changes a moment after the user stops editing.
+			NoteFilterChanges();
+			TickAutosave();
 		}
 
 		ImGui::End();
@@ -762,6 +1451,12 @@ bool ConsumeSaveSettingsRequest()
 	return pressed;
 }
 
+void SaveSettings()
+{
+	SaveOverlaySettings();
+	g_settingsDirty = false;
+}
+
 void OnLostDevice()
 {
 	ImGuiBridge::InvalidateDeviceObjects();
@@ -776,11 +1471,13 @@ void OnEndScene(LPDIRECT3DDEVICE9 device)
 {
 	if (!device) return;
 
-	// First frame: honour the "overlay" setting from packet_log.ini.
+	// First frame: honour the "overlay" setting from packet_log.ini and any
+	// saved panel/filter state from overlay.ini.
 	if (!g_visibleInitialised)
 	{
 		g_visibleInitialised = true;
 		g_visible = PacketCapture::OverlayEnabledAtStartup();
+		LoadOverlaySettings();
 	}
 
 	if (g_startTick == 0) g_startTick = GetTickCount();

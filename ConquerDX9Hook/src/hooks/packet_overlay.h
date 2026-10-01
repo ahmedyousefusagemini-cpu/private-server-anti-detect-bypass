@@ -49,6 +49,13 @@ namespace PacketOverlay {
 	void SetVisible(bool visible);
 
 	// True when the user clicked "Save Settings" since the last call; the flag
-	// is cleared on read, so the caller sees each click exactly once.
+	// is cleared on read, so the caller sees each click exactly once. The
+	// click already persisted the panel state to overlay.ini - this is only
+	// for a caller that wants to mirror the settings elsewhere.
 	bool ConsumeSaveSettingsRequest();
+
+	// Writes the panel's filter/tab state to overlay.ini next to the game exe.
+	// Called by the Save Settings button and by the autosave tick; exposed so
+	// the shutdown path can flush too.
+	void SaveSettings();
 }
