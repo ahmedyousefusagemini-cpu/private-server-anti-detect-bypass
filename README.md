@@ -113,8 +113,29 @@ The decoded-field list labels each field where its meaning is **verified**
 (e.g. field 9 is the client clock — proven to 3 ms over 27 minutes) and marks
 the rest `(unknown)`. **Set Reference** / **Clear Diff** identify the unknown
 ones: snapshot a jump, move a long way, reload, and every field that changed is
-flagged. That is the route to the coordinate fields. See
+flagged. Labels are kept **per message id**, because `0x0833` and `0x0898`
+number their fields differently and one shared table would mislabel both. See
 [docs/action-protobuf-fields.md](docs/action-protobuf-fields.md).
+
+### Jump to a cell
+
+The builder's **Jump to cell** row moves the character to a chosen `x, y`. It
+sends a `0x0898` `CMsgWalk` whose field 4 is the target cell:
+
+```
+f4 = (y << 16) | (x << 8) | frac
+```
+
+`x` and `y` were confirmed against eleven real captures on straight walks
+(three moved `x` 53 → 59 → 171 with `y` pinned; eight moved `x` 163 → 169 with
+`y` pinned), and the packed value advances by a near-constant ~198 counts per
+packet — so the field is a fixed-point position and the low byte is a
+fractional part, not padding. A jump zeroes that fraction so the character
+lands exactly on the tile. Everything else is copied from a real capture, and
+`f4` is rewritten through the varint re-encoder because its length changes.
+
+Full derivation, the capture tables, and what is still open:
+[docs/walk-position-fields.md](docs/walk-position-fields.md).
 
 ### Controls
 
@@ -214,6 +235,7 @@ docs/packet-hooks.md         Ghidra derivation of the two hook addresses
 docs/packet-catalog.md       every message id, its name and its meaning
 docs/packet-send.md          how a packet is built and sent (and why replay)
 docs/action-protobuf-fields.md  what each CMsgAction (0x0833) field is, and how to identify the rest
+docs/walk-position-fields.md    where the 0x0898 walk target cell lives, and its packing
 docs/overlay-imgui.md        how ImGui is wired into the hook / reset path
 ```
 
