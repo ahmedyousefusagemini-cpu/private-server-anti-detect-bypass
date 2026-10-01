@@ -838,6 +838,33 @@ namespace {
 		return false;
 	}
 
+	// Writes the body's field numbers into `out` as "1,7,8,9,...". Used to
+	// explain a failed edit: knowing which fields a template actually has is
+	// what tells the operator they picked the wrong shape.
+	void ListFieldNumbers(const uint8_t* body, int bodyBytes, char* out, size_t outSize)
+	{
+		if (!out || outSize == 0) return;
+		out[0] = '\0';
+		if (!body || bodyBytes <= 2) return;
+
+		int offset = 2;
+		size_t used = 0;
+		while (offset < bodyBytes)
+		{
+			ProtoField field;
+			if (!ReadProtoField(body, bodyBytes, offset, field)) break;
+
+			char one[16];
+			_snprintf_s(one, _TRUNCATE, "%s%d", used ? "," : "", field.fieldNumber);
+			const size_t len = strlen(one);
+			if (used + len + 1 >= outSize) { strncat_s(out, outSize, ",...", _TRUNCATE); break; }
+			strncat_s(out, outSize, one, _TRUNCATE);
+			used += len;
+
+			offset = field.nextOffset;
+		}
+	}
+
 	// Reads the move target (f7/f8) out of a body, so the UI can seed its
 	// boxes from a real capture instead of making the operator guess.
 	bool ReadMoveTarget(const uint8_t* body, int bodyBytes,
@@ -861,9 +888,24 @@ namespace {
 	// last known position, so it becomes the origin.
 	bool BuildJumpGoal(int x, int y)
 	{
-		// Always reload from the capture: a previous jump left its own target
-		// in the body, and stacking a new one on top of that would compound.
-		if (!LoadBuilderTemplate(g_walkMsgId, false)) return false;
+		// Use the template that is already loaded when it is the right id.
+		//
+		// This used to reload unconditionally, which silently threw away a
+		// specific capture the operator had picked with "Use Selected" and
+		// substituted the slot's LATEST 0x0833 - often a different action
+		// with no position fields. Reloading is only needed when nothing
+		// suitable is loaded yet.
+		//
+		// Not reloading is safe for repeats: f7/f8 and f14/f15 are written as
+		// absolute values, so a second jump overwrites the first rather than
+		// compounding with it.
+		const uint16_t loadedId = (g_buildHasTemplate && g_buildBodyBytes >= 2)
+			? (uint16_t)(g_buildBody[0] | (g_buildBody[1] << 8)) : 0;
+
+		if (!g_buildHasTemplate || loadedId != g_walkMsgId)
+		{
+			if (!LoadBuilderTemplate(g_walkMsgId, false)) return false;
+		}
 
 		// Read the "here" estimate BEFORE overwriting the target.
 		int curX = 0, curY = 0;
@@ -940,6 +982,56 @@ namespace {
 
 		// The first protobuf field sits at body+2 (body[0..1] is the id).
 		// Surface it as the "field 1" hint when there is one.
+		ProtoField first;
+		if (ReadProtoField(g_buildBody, g_buildBodyBytes, 2, first) && first.fieldNumber == 1)
+			g_buildMode = (uint16_t)first.value;
+
+		return true;
+	}
+
+	// Loads the builder body from a captured packet's RAW BYTES, instead of
+	// from the slot.
+	//
+	// This exists because the slot keeps only the LATEST message for an id.
+	// A client that sends several different 0x0833 actions overwrites the one
+	// you want with the next one: walk a step, stop, and the "stop" packet
+	// replaces the "walk" packet. 0x0833 comes in four shapes in practice
+	// (16 / 20 / 25 / 42 bytes) and only the 42-byte one carries the position
+	// fields, so reloading from the slot frequently lands on a shape with no
+	// f7/f8 - which is exactly the "Fields 7/8 missing" report.
+	//
+	// `packet` is the full wire packet: [u16 size][u16 id][payload]. The
+	// builder's body starts at the id, so it is packet+2 for size-2 bytes.
+	//
+	// The vtable still comes from the slot at send time. A vtable is
+	// per-class, not per-instance, so any 0x0833 body is valid with the
+	// 0x0833 vtable - but the class must have been seen at least once, which
+	// is what the slot lookup below checks.
+	bool LoadBuilderFromBytes(const uint8_t* packet, int packetBytes)
+	{
+		if (!packet || packetBytes < 6) return false;
+
+		const uint16_t declared = (uint16_t)(packet[0] | (packet[1] << 8));
+		if (declared < 4 || declared > PacketSend::kMaxMessageBytes) return false;
+		if ((int)declared > packetBytes) return false;   // the ring truncated it
+
+		const uint16_t messageId = (uint16_t)(packet[2] | (packet[3] << 8));
+
+		// The send path refuses a body whose id disagrees with the armed id,
+		// and it needs a vtable for that class. Both come from the slot, so
+		// require one to exist rather than failing later at send time.
+		PacketSend::Slot slot;
+		if (!PacketSend::GetSlot(messageId, slot)) return false;
+
+		const int bodyBytes = (int)declared - 2;         // id + payload
+		if (bodyBytes < 2 || bodyBytes > PacketSend::kMaxBodyBytes) return false;
+
+		memcpy(g_buildBody, packet + 2, (size_t)bodyBytes);
+		g_buildBodyBytes = bodyBytes;
+		g_buildArmedId = messageId;
+		g_buildHasTemplate = true;
+		g_buildRawDirty = true;
+
 		ProtoField first;
 		if (ReadProtoField(g_buildBody, g_buildBodyBytes, 2, first) && first.fieldNumber == 1)
 			g_buildMode = (uint16_t)first.value;
@@ -1968,19 +2060,24 @@ namespace {
 						g_buildFlashError = true;
 						g_buildFlashUntil = (float)ImGui::GetTime() + 3.0f;
 					}
-					else if (!LoadBuilderTemplate(entry.messageId, false))
+					// Load THIS row's bytes, not the slot's latest. The whole
+					// point of selecting a row is to choose which of several
+					// same-id shapes you want; going back to the slot would
+					// silently substitute the newest one.
+					else if (!LoadBuilderFromBytes(entry.data, entry.storedBytes))
 					{
 						_snprintf_s(g_buildFlashText, _TRUNCATE,
-							"0x%04X has no captured send to replay", (unsigned)entry.messageId);
+							"Could not load 0x%04X from that row (truncated or unknown class)",
+							(unsigned)entry.messageId);
 						g_buildFlashError = true;
-						g_buildFlashUntil = (float)ImGui::GetTime() + 3.0f;
+						g_buildFlashUntil = (float)ImGui::GetTime() + 4.0f;
 					}
 					else
 					{
 						_snprintf_s(g_buildIdText, _TRUNCATE, "0x%04X", (unsigned)entry.messageId);
 						_snprintf_s(g_buildFlashText, _TRUNCATE,
-							"Loaded 0x%04X from selection (%d bytes)",
-							(unsigned)entry.messageId, g_buildBodyBytes);
+							"Loaded 0x%04X from row %u (%d bytes)",
+							(unsigned)entry.messageId, entry.seq, g_buildBodyBytes);
 						g_buildFlashError = false;
 						g_buildFlashUntil = (float)ImGui::GetTime() + 2.5f;
 					}
@@ -2185,9 +2282,15 @@ namespace {
 			{
 				g_buildFlashUntil = (float)ImGui::GetTime() + 4.0f;
 				g_buildFlashError = true;
+				// Name the fields the template DOES have - that is what tells
+				// the operator they loaded the wrong shape, and which shape
+				// to go looking for instead.
+				char have[96];
+				ListFieldNumbers(g_buildBody, g_buildBodyBytes, have, sizeof(have));
 				_snprintf_s(g_buildFlashText, _TRUNCATE,
-					"Fields %d/%d missing in the 0x%04X template",
-					g_walkPosFieldX, g_walkPosFieldY, (unsigned)g_walkMsgId);
+					"No fields %d/%d in this 0x%04X (%d bytes). Has: %s",
+					g_walkPosFieldX, g_walkPosFieldY, (unsigned)g_walkMsgId,
+					g_buildBodyBytes, have);
 			}
 		}
 		if (!canJump) ImGui::EndDisabled();
