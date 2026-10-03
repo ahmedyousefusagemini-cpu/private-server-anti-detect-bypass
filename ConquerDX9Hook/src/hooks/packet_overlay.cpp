@@ -1030,6 +1030,91 @@ namespace {
 		}
 	}
 
+	// Writes a coordinate back through the same encoding DecodeCoord reads.
+	//
+	// The encoded pointer and its key are left exactly as they were; only the
+	// dword they point at changes, re-XORed with the same key. The client's
+	// own reader therefore keeps working - this is the inverse of the read,
+	// not a second format to keep in sync.
+	//
+	//     *(*(p + offA) ^ *(p + offK)) = value ^ *(p + offK)
+	//
+	// Guarded like the read: the address is decoded from object contents, so a
+	// wrong offset must fail quietly rather than fault.
+	bool EncodeCoord(uint32_t self, int offA, int offK, uint32_t value)
+	{
+		if (!self) return false;
+
+		__try
+		{
+			const uint8_t* p = (const uint8_t*)(uintptr_t)self;
+			const uint32_t a = *(const uint32_t*)(p + offA);
+			const uint32_t k = *(const uint32_t*)(p + offK);
+
+			if (a == 0) return false;                 // no storage to write
+			*(uint32_t*)(uintptr_t)(a ^ k) = value ^ k;
+			return true;
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+			return false;
+		}
+	}
+
+	// Which decoded pair is X and which is Y.
+	//
+	// The Process function passes (+0x468,+0x46C) and (+0x474,+0x478) to the
+	// sender, but the decompiler's argument order is not trustworthy and
+	// guessing would silently mirror every move. So it is CALIBRATED: the
+	// first time a decoded pair and a real move are both available, whichever
+	// ordering matches the true coordinates wins.
+	//
+	//   0 = unknown, 1 = 468-pair is X, 2 = 474-pair is X
+	int g_axisOrder = 0;
+
+	void CalibrateAxes(uint32_t self, int trueX, int trueY)
+	{
+		if (g_axisOrder != 0) return;
+
+		uint32_t c1 = 0, c2 = 0;
+		if (!DecodeCoord(self, 0x468, 0x46C, c1)) return;
+		if (!DecodeCoord(self, 0x474, 0x478, c2)) return;
+
+		if ((int)c1 == trueX && (int)c2 == trueY) g_axisOrder = 1;
+		else if ((int)c2 == trueX && (int)c1 == trueY) g_axisOrder = 2;
+
+		if (g_axisOrder)
+			HookLog("[Role] axis order calibrated: %s pair is X (decoded %u/%u, true %d/%d)",
+				g_axisOrder == 1 ? "+468" : "+474", c1, c2, trueX, trueY);
+	}
+
+	// Pushes a position into the client's own object so it agrees with what
+	// the server has just accepted.
+	//
+	// The server moves us and broadcasts the result, but a client ignores
+	// position updates for its own character - it trusts its own state and
+	// keeps re-sending it. Without this the two drift apart, and the next move
+	// is sent from a stale origin.
+	bool ResyncClientPosition(int x, int y)
+	{
+		PacketCapture::RoleProbe rp;
+		if (!PacketCapture::GetRoleProbe(rp)) return false;
+
+		// Without a calibration the axis order is unknown, and writing the
+		// wrong way round would mirror the character. Refuse rather than risk
+		// it - the caller reports this honestly.
+		if (g_axisOrder == 0) return false;
+
+		const bool okX = (g_axisOrder == 1)
+			? EncodeCoord(rp.self, 0x468, 0x46C, (uint32_t)x)
+			: EncodeCoord(rp.self, 0x474, 0x478, (uint32_t)x);
+		const bool okY = (g_axisOrder == 1)
+			? EncodeCoord(rp.self, 0x474, 0x478, (uint32_t)y)
+			: EncodeCoord(rp.self, 0x468, 0x46C, (uint32_t)y);
+
+		return okX && okY;
+	}
+
 	// Writes a complete 0x0833 move body from scratch.
 	//
 	// This replaces editing a captured template, which was the wrong design.
@@ -2538,6 +2623,13 @@ namespace {
 			// Everyone else on the map is moving too, and their broadcasts
 			// would otherwise be read as our own success.
 			PacketCapture::WatchCharacter(live.id);
+
+			// A real move is the one moment the true coordinates are known,
+			// which is what settles which decoded pair is X. Cheap and only
+			// does anything the first time.
+			PacketCapture::RoleProbe rp;
+			if (PacketCapture::GetRoleProbe(rp))
+				CalibrateAxes(rp.self, live.targetX, live.targetY);
 		}
 		else
 		{
@@ -2574,6 +2666,16 @@ namespace {
 					g_moveFromX, g_moveFromY, g_moveToX, g_moveToY,
 					DirectionFromDelta(g_moveToX - g_moveFromX, g_moveToY - g_moveFromY),
 					g_walkGoalBytes, (unsigned)g_walkGoalMsgId);
+
+				// The server will move us, but the client ignores position
+				// updates for its own character - so write the new position
+				// into the object too, or the two drift apart and the next
+				// move is sent from a stale origin.
+				if (ResyncClientPosition(g_moveToX, g_moveToY))
+					HookLog("[Move] client resynced to (%d,%d)", g_moveToX, g_moveToY);
+				else
+					HookLog("[Move] client NOT resynced (axis order not calibrated "
+						"yet - move once by hand so it can be worked out)");
 			}
 			else
 			{
@@ -2803,7 +2905,9 @@ namespace {
 
 			if (ok1 && ok2)
 			{
-				ImGui::TextDisabled("  decoded: %u / %u", c1, c2);
+				ImGui::TextDisabled("  decoded: %u / %u   axes: %s", c1, c2,
+					g_axisOrder == 0 ? "not calibrated"
+					: (g_axisOrder == 1 ? "+468 is X" : "+474 is X"));
 
 				// Log it too, once a second. The panel is the live view; the
 				// log is what survives a session and can be compared against
