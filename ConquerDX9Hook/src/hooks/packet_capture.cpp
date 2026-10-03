@@ -553,6 +553,8 @@ namespace {
 			g_lastAction.targetX = a7;
 			g_lastAction.targetY = a8;
 			g_lastAction.clock = (uint32_t)a9;
+			g_lastAction.f17 = a10;
+			g_lastAction.f20raw = a11;
 			g_lastAction.capturedTick = GetTickCount();
 			LeaveCriticalSection(&g_lock);
 		}

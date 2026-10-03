@@ -145,6 +145,14 @@ namespace PacketCapture {
 		int      mode;
 		uint32_t clock;              // client clock at capture time
 		uint32_t capturedTick;       // GetTickCount() at capture time
+
+		// The two trailing fields of a move, carried so a synthesised move
+		// matches the client's own byte for byte. Both are constant in every
+		// capture seen (f17 = 10364, f20 = all-ones), but taking them from a
+		// real action rather than hardcoding them means a client that changes
+		// them does not silently start producing rejected packets.
+		int      f17;
+		int      f20raw;             // -1 in every capture (a uint64 all-ones)
 	};
 
 	// Copies the last observed action. Returns false if the hook has not

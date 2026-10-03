@@ -246,7 +246,6 @@ namespace {
 	int    g_walkX = 0;                            // target, in map cells
 	int    g_walkY = 0;
 	char   g_walkTargetText[64] = "";              // typed "x,y" for the quick box
-	bool   g_walkStampOrigin = true;               // also rewrite f14/f15 from the capture
 
 	// Move verification.
 	//
@@ -938,8 +937,79 @@ namespace {
 		return true;
 	}
 
-	// Builds the jump body: loads the 0x0833 template, writes the destination
-	// into f7/f8 and a matching origin into f14/f15, and stores the result.
+	// Writes a complete 0x0833 move body from scratch.
+	//
+	// This replaces editing a captured template, which was the wrong design.
+	// The client sends several shapes under the same id and the one that
+	// carries a position is rare - 18 of 2401 captures - so "load the 0x0833
+	// template" would usually hand back a different action entirely (an
+	// 87-byte Lua message with no position fields was the common case). Every
+	// field a move needs is now known, so there is nothing to look up.
+	//
+	// Fields are written in ascending order, which is the order the client
+	// itself uses:
+	//
+	//   33 08          id   0x0833 (the body starts at the id)
+	//   08 <id>        f1   character id
+	//   38 <x>         f7   target X
+	//   40 <y>         f8   target Y
+	//   48 <clock>     f9   client clock (ms)
+	//   60 89 01       f12  mode 137 = move
+	//   68 <dir>       f13  direction
+	//   70 <originX>   f14  origin X
+	//   78 <originY>   f15  origin Y
+	//   88 01 <f17>    f17  (2-byte tag)
+	//   A0 01 <f20>    f20  all-ones sentinel (2-byte tag)
+	//
+	// f13/f17/f20 come from the client's own last move rather than being
+	// hardcoded, so a client that changes them does not silently start
+	// producing rejected packets.
+	//
+	// Returns the body length, or 0 if it would not fit.
+	int BuildMoveBody(uint8_t* out, int maxBytes,
+		const PacketCapture::LastAction& live,
+		int x, int y, int originX, int originY, uint32_t clock)
+	{
+		if (!out || maxBytes < 64) return 0;
+
+		int n = 0;
+		out[n++] = 0x33;                 // id 0x0833, little endian
+		out[n++] = 0x08;
+
+		out[n++] = 0x08;                 // f1 character id
+		n = WriteVarint(out, n, maxBytes, live.id);
+
+		out[n++] = 0x38;                 // f7 target X
+		n = WriteVarint(out, n, maxBytes, (uint64_t)x);
+
+		out[n++] = 0x40;                 // f8 target Y
+		n = WriteVarint(out, n, maxBytes, (uint64_t)y);
+
+		out[n++] = 0x48;                 // f9 client clock
+		n = WriteVarint(out, n, maxBytes, clock);
+
+		out[n++] = 0x60;                 // f12 mode
+		n = WriteVarint(out, n, maxBytes, 137);
+
+		out[n++] = 0x68;                 // f13 direction
+		n = WriteVarint(out, n, maxBytes, (uint64_t)(live.dir & 0xFF));
+
+		out[n++] = 0x70;                 // f14 origin X
+		n = WriteVarint(out, n, maxBytes, (uint64_t)originX);
+
+		out[n++] = 0x78;                 // f15 origin Y
+		n = WriteVarint(out, n, maxBytes, (uint64_t)originY);
+
+		out[n++] = 0x88; out[n++] = 0x01;   // f17, two-byte tag
+		n = WriteVarint(out, n, maxBytes, (uint64_t)(uint32_t)live.f17);
+
+		out[n++] = 0xA0; out[n++] = 0x01;   // f20, two-byte tag
+		n = WriteVarint(out, n, maxBytes, (uint64_t)(int64_t)live.f20raw);
+
+		return (n <= maxBytes) ? n : 0;
+	}
+
+	// Builds the jump body: synthesises a 0x0833 move, and stores the result.
 	//
 	// A 0x0833 move carries BOTH ends: f14/f15 is where the move started and
 	// f7/f8 is where it ends. Writing only the target would leave the origin
@@ -948,91 +1018,31 @@ namespace {
 	// last known position, so it becomes the origin.
 	bool BuildJumpGoal(int x, int y)
 	{
-		// Use the template that is already loaded when it is the right id.
-		//
-		// This used to reload unconditionally, which silently threw away a
-		// specific capture the operator had picked with "Use Selected" and
-		// substituted the slot's LATEST 0x0833 - often a different action
-		// with no position fields. Reloading is only needed when nothing
-		// suitable is loaded yet.
-		//
-		// Not reloading is safe for repeats: f7/f8 and f14/f15 are written as
-		// absolute values, so a second jump overwrites the first rather than
-		// compounding with it.
-		const uint16_t loadedId = (g_buildHasTemplate && g_buildBodyBytes >= 2)
-			? (uint16_t)(g_buildBody[0] | (g_buildBody[1] << 8)) : 0;
-
-		if (!g_buildHasTemplate || loadedId != g_walkMsgId)
-		{
-			if (!LoadBuilderTemplate(g_walkMsgId, false)) return false;
-		}
-
-		// Where the character is NOW. The ACTION hook knows: it saw the last
-		// move the client sent itself, and that move's target is where the
-		// character ended up. The capture's own target is only a fallback -
-		// it is wherever the character stood when the packet was recorded,
-		// which may be a long walk ago.
-		int curX = 0, curY = 0;
-		bool haveCur = false;
-
+		// Everything comes from the client's own last move. Without one there
+		// is no id, direction or f17 to build with, and guessing them would
+		// produce a packet the server rejects for reasons we cannot see.
 		PacketCapture::LastAction live;
-		const bool haveLive = PacketCapture::GetLastAction(live);
-		if (haveLive)
-		{
-			curX = live.targetX;
-			curY = live.targetY;
-			haveCur = true;
-		}
-		else
-		{
-			haveCur = ReadMoveTarget(g_buildBody, g_buildBodyBytes,
-				g_walkPosFieldX, g_walkPosFieldY, curX, curY);
-		}
+		if (!PacketCapture::GetLastAction(live)) return false;
 
-		// Destination first, then origin - each write can change the body
-		// length, so every call takes the current cursor.
-		int n = SetFieldValue(g_buildBody, g_buildBodyBytes, g_walkPosFieldX, (uint64_t)x);
-		if (n < 0) return false;
-		g_buildBodyBytes = n;
-
-		n = SetFieldValue(g_buildBody, g_buildBodyBytes, g_walkPosFieldY, (uint64_t)y);
-		if (n < 0) return false;
-		g_buildBodyBytes = n;
-
-		if (g_walkStampOrigin && haveCur)
-		{
-			n = SetFieldValue(g_buildBody, g_buildBodyBytes,
-				g_walkOriginFieldX, (uint64_t)curX);
-			if (n < 0) return false;
-			g_buildBodyBytes = n;
-
-			n = SetFieldValue(g_buildBody, g_buildBodyBytes,
-				g_walkOriginFieldY, (uint64_t)curY);
-			if (n < 0) return false;
-			g_buildBodyBytes = n;
-		}
-
-		// Refresh the clock.
-		//
-		// This is the difference between a move the server accepts and one it
-		// silently drops. A replayed capture carries the timestamp from
-		// whenever it was recorded - potentially minutes old - and a stale
-		// timestamp reads as out-of-order traffic. The hook gives us the
-		// client's own clock at a known tick, so age it forward to now.
+		// The clock is aged forward to now. A replayed capture carries the
+		// timestamp from whenever it was recorded - potentially minutes old -
+		// and a stale timestamp reads as out-of-order traffic.
 		//
 		// Only the hook's clock is used. Guessing the epoch (GetTickCount, a
 		// login timer, ...) would be a guess; this value is observed.
-		if (g_walkStampClock && g_walkClockField > 0 && haveLive)
-		{
-			const uint32_t aged = live.clock
-				+ (uint32_t)(GetTickCount() - live.capturedTick)
-				+ (uint32_t)g_jumpSpeedMs;
+		const uint32_t clock = live.clock
+			+ (uint32_t)(GetTickCount() - live.capturedTick)
+			+ (uint32_t)(g_walkStampClock ? g_jumpSpeedMs : 0);
 
-			n = SetFieldValue(g_buildBody, g_buildBodyBytes,
-				g_walkClockField, (uint64_t)aged);
-			if (n < 0) return false;
-			g_buildBodyBytes = n;
-		}
+		// The origin is where the character actually is, which is where its
+		// last move ended.
+		const int originX = live.targetX;
+		const int originY = live.targetY;
+
+		const int n = BuildMoveBody(g_buildBody, PacketSend::kMaxBodyBytes,
+			live, x, y, originX, originY, clock);
+		if (n <= 2) return false;
+		g_buildBodyBytes = n;
 
 		// Latch the id so the send path's consistency guard is satisfied.
 		g_buildArmedId = g_walkMsgId;
@@ -2457,23 +2467,34 @@ namespace {
 			// Name the fields the template DOES have - that is what tells the
 			// operator they loaded the wrong shape, and which shape to go
 			// looking for instead.
-			char have[96];
-			ListFieldNumbers(g_buildBody, g_buildBodyBytes, have, sizeof(have));
-			g_buildFlashUntil = (float)ImGui::GetTime() + 4.0f;
-			g_buildFlashError = true;
-			_snprintf_s(g_buildFlashText, _TRUNCATE,
-				"No fields %d/%d in this 0x%04X (%d bytes). Has: %s",
-				g_walkPosFieldX, g_walkPosFieldY, (unsigned)g_walkMsgId,
-				g_buildBodyBytes, have);
+			// The move is now synthesised from the client's own last action,
+			// so the only reasons to fail are "no real move seen yet" (no id,
+			// direction or f17 to build with) and "it would not fit".
+			PacketCapture::LastAction probe;
+			const bool haveLive = PacketCapture::GetLastAction(probe);
 
-			// Log it too. This branch used to only touch the panel, so a
-			// refused move left NO trace in the file - which makes "the
-			// character did not move" indistinguishable from "the button was
-			// never pressed" when reading the log afterwards.
-			HookLog("[Move] REFUSED - no fields %d/%d in this 0x%04X "
-				"(%d bytes). Has: %s",
-				g_walkPosFieldX, g_walkPosFieldY, (unsigned)g_walkMsgId,
-				g_buildBodyBytes, have);
+			g_buildFlashUntil = (float)ImGui::GetTime() + 5.0f;
+			g_buildFlashError = true;
+
+			if (!haveLive)
+			{
+				_snprintf_s(g_buildFlashText, _TRUNCATE,
+					"No live move yet - walk once, then press Move");
+
+				// Log it too: a refusal that only touches the panel leaves no
+				// trace in the file, so "did not move" and "never tried" look
+				// identical when reading the log afterwards.
+				HookLog("[Move] REFUSED - no live move observed yet. Walk once so "
+					"the id, direction and f17 come from a real move.");
+			}
+			else
+			{
+				char have[96];
+				ListFieldNumbers(g_buildBody, g_buildBodyBytes, have, sizeof(have));
+				_snprintf_s(g_buildFlashText, _TRUNCATE,
+					"Could not build the move (%d bytes)", g_buildBodyBytes);
+				HookLog("[Move] REFUSED - could not build the move. Has: %s", have);
+			}
 		}
 	}
 
@@ -2593,11 +2614,11 @@ namespace {
 			}
 		}
 
+		// "stamp origin" used to live here. It is gone because the origin is
+		// now ALWAYS the character's live position - there is no captured
+		// origin left to choose between, so the toggle had nothing to do.
 		ImGui::SameLine();
-		ImGui::Checkbox("stamp origin##jumpcell", &g_walkStampOrigin);
-
-		ImGui::SameLine();
-		ImGui::Checkbox("stamp clock##jumpcell", &g_walkStampClock);
+		ImGui::Checkbox("lead clock##jumpcell", &g_walkStampClock);
 		if (g_walkStampClock)
 		{
 			ImGui::SameLine();
