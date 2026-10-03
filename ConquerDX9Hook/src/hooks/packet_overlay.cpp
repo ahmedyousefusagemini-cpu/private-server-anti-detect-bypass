@@ -2996,23 +2996,40 @@ namespace {
 			const bool ok1 = DecodeCoord(roleObj, 0x468, 0x46C, c1);
 			const bool ok2 = DecodeCoord(roleObj, 0x474, 0x478, c2);
 
-			if (ok1 && ok2)
+			// Log UNCONDITIONALLY, once a second.
+			//
+			// This used to be inside the success branch, which made a FAILED
+			// decode completely silent - so there was no way to tell "the hook
+			// never fired" from "the object pointer is wrong" from "the decode
+			// returned nonsense". A diagnostic that only speaks when things
+			// work is worse than none. Every input is printed raw.
 			{
-				ImGui::TextDisabled("  decoded: %u / %u   axes: %s", c1, c2,
-					g_axisOrder == 0 ? "not calibrated"
-					: (g_axisOrder == 1 ? "+468 is X" : "+474 is X"));
-
-				// Log it too, once a second. The panel is the live view; the
-				// log is what survives a session and can be compared against
-				// the coordinates the game itself shows.
 				static uint32_t lastRoleLogTick = 0;
 				const uint32_t nowTick = GetTickCount();
 				if (nowTick - lastRoleLogTick >= 1000)
 				{
 					lastRoleLogTick = nowTick;
-					HookLog("[Role] @0x%08X decoded X=%u Y=%u  (live action %s)",
-						roleObj, c1, c2, haveLive ? "yes" : "no");
+
+					uint32_t a1 = 0, k1 = 0, a2 = 0, k2 = 0;
+					ReadRoleWords(roleObj, 0x468, &a1, 1);
+					ReadRoleWords(roleObj, 0x46C, &k1, 1);
+					ReadRoleWords(roleObj, 0x474, &a2, 1);
+					ReadRoleWords(roleObj, 0x478, &k2, 1);
+
+					HookLog("[Role] obj=0x%08X (hook=%s global=0x%08X) | "
+						"A1=%08X K1=%08X A2=%08X K2=%08X | decode %s -> X=%u Y=%u | live=%s",
+						roleObj, fromHook ? "yes" : "no", GetHeroObject(),
+						a1, k1, a2, k2,
+						(ok1 && ok2) ? "ok" : "FAILED", c1, c2,
+						haveLive ? "yes" : "no");
 				}
+			}
+
+			if (ok1 && ok2)
+			{
+				ImGui::TextDisabled("  decoded: %u / %u   axes: %s", c1, c2,
+					g_axisOrder == 0 ? "not calibrated"
+					: (g_axisOrder == 1 ? "+468 is X" : "+474 is X"));
 
 				// Feed the boxes from memory when there is no live move, which
 				// is what removes the "walk once" dependency entirely.
@@ -3033,7 +3050,25 @@ namespace {
 					words[0], words[1], words[2], words[3]);
 		}
 		else
-			Caption("role object not seen yet - the ROLE hook has not fired.");
+		{
+			Caption("role object not seen yet - neither the ROLE hook nor the "
+				"hero global produced a pointer.");
+
+			// Log the failure too. Without this the "no object" case is
+			// invisible in the file, which is how it stayed unexplained.
+			static uint32_t lastNoObjTick = 0;
+			const uint32_t t = GetTickCount();
+			if (t - lastNoObjTick >= 2000)
+			{
+				lastNoObjTick = t;
+				PacketCapture::RoleProbe probe;
+				const bool hooked = PacketCapture::GetRoleProbe(probe);
+				HookLog("[Role] NO OBJECT - hook fired=%s (self=0x%08X), "
+					"global 0x%08X reads 0x%08X",
+					hooked ? "yes" : "no", hooked ? probe.self : 0,
+					(unsigned)(0x01A64560u), GetHeroObject());
+			}
+		}
 
 		if (g_walkHasGoal)
 		{
