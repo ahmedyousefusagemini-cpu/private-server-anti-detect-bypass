@@ -1788,6 +1788,44 @@ namespace {
 				draw->AddCircleFilled(p, 2.0f, dotColour);
 			}
 			ImGui::Dummy(canvasSize);
+
+			// ---- position readout, under the preview ----------------------
+			//
+			// Read from the character object rather than from traffic, so it
+			// is correct from the moment you log in - standing still included.
+			ImGui::Spacing();
+			{
+				const uint32_t obj = CurrentRoleObject();
+				uint32_t px = 0xFFFFFFFFu, py = 0xFFFFFFFFu;
+				const bool okX = DecodeCoord(obj, 0x468, 0x46C, px);
+				const bool okY = DecodeCoord(obj, 0x474, 0x478, py);
+				const bool sane = obj && okX && okY && px <= 4095 && py <= 4095;
+
+				if (sane)
+				{
+					ImGui::Text("Position:  X %u   Y %u", px, py);
+					ImGui::SameLine();
+					ImGui::TextDisabled("(read from memory)");
+				}
+				else if (!obj)
+				{
+					ImGui::TextDisabled("Position: character object not found yet");
+				}
+				else
+				{
+					// Say which half failed. "unreadable" on its own would
+					// hide whether it is the pointer or the decode.
+					ImGui::TextDisabled("Position: unreadable - obj 0x%08X, X %s, Y %s",
+						obj, okX ? "ok" : "failed", okY ? "ok" : "failed");
+				}
+
+				// Keep the move boxes in step, so the two never disagree.
+				if (g_walkFollow && sane)
+				{
+					g_walkX = (int)px;
+					g_walkY = (int)py;
+				}
+			}
 		}
 	}
 
