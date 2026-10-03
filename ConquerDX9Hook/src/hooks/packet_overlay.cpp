@@ -981,6 +981,43 @@ namespace {
 		return (dx > 0) ? 6 : 2;                   // east / west
 	}
 
+	// The hero object, read from the client's own singleton global.
+	//
+	// The accessor at 0x0043e561 shows it plainly:
+	//     CMP  [0x01a64560], 0
+	//     JNZ  +
+	//     CALL <create>
+	//     MOV  EAX, [0x01a64560]
+	//     RET
+	// so 0x01A64560 holds the hero pointer, created on first use. Reading it
+	// directly means the position is available even if the ROLE hook has not
+	// fired - no detour required.
+	const uintptr_t kRvaHeroGlobal = 0x01664560u;   // absolute 0x01A64560
+
+	uint32_t GetHeroObject()
+	{
+		__try
+		{
+			const uintptr_t base = (uintptr_t)GetModuleHandleA(NULL);
+			if (!base) return 0;
+			return *(const uint32_t*)(base + kRvaHeroGlobal);
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+			return 0;
+		}
+	}
+
+	// The object to read the position from: the hook's if it has fired,
+	// otherwise the global. Both are the same object; the global is simply
+	// available sooner.
+	uint32_t CurrentRoleObject()
+	{
+		PacketCapture::RoleProbe rp;
+		if (PacketCapture::GetRoleProbe(rp) && rp.self) return rp.self;
+		return GetHeroObject();
+	}
+
 	// Reads dwords out of the role object.
 	//
 	// Guarded because the pointer comes from a hook: if the object is freed or
@@ -1082,7 +1119,14 @@ namespace {
 	// ordering matches the true coordinates wins.
 	//
 	//   0 = unknown, 1 = 468-pair is X, 2 = 474-pair is X
-	int g_axisOrder = 0;
+	//
+	// Defaults to 1 because the disassembly PROVED it, not because it was
+	// assumed. In FUN_00ed2e14 the (+0x468,+0x46C) pair is decoded into EDX
+	// and EDX is then pushed as param_7, which is the target X; the
+	// (+0x474,+0x478) pair lands in ESI and is pushed as param_8, the target
+	// Y. The calibration below is kept as a safety net in case a different
+	// client build orders them the other way.
+	int g_axisOrder = 1;
 
 	void CalibrateAxes(uint32_t self, int trueX, int trueY)
 	{
@@ -1109,20 +1153,21 @@ namespace {
 	// is sent from a stale origin.
 	bool ResyncClientPosition(int x, int y)
 	{
-		PacketCapture::RoleProbe rp;
-		if (!PacketCapture::GetRoleProbe(rp)) return false;
+		// The global works even when the ROLE hook has not fired.
+		const uint32_t self = CurrentRoleObject();
+		if (!self) return false;
 
-		// Without a calibration the axis order is unknown, and writing the
-		// wrong way round would mirror the character. Refuse rather than risk
-		// it - the caller reports this honestly.
+		// Without a known axis order, writing the wrong way round would mirror
+		// the character. Refuse rather than risk it - the caller reports this
+		// honestly.
 		if (g_axisOrder == 0) return false;
 
 		const bool okX = (g_axisOrder == 1)
-			? EncodeCoord(rp.self, 0x468, 0x46C, (uint32_t)x)
-			: EncodeCoord(rp.self, 0x474, 0x478, (uint32_t)x);
+			? EncodeCoord(self, 0x468, 0x46C, (uint32_t)x)
+			: EncodeCoord(self, 0x474, 0x478, (uint32_t)x);
 		const bool okY = (g_axisOrder == 1)
-			? EncodeCoord(rp.self, 0x474, 0x478, (uint32_t)y)
-			: EncodeCoord(rp.self, 0x468, 0x46C, (uint32_t)y);
+			? EncodeCoord(self, 0x474, 0x478, (uint32_t)y)
+			: EncodeCoord(self, 0x468, 0x46C, (uint32_t)y);
 
 		return okX && okY;
 	}
@@ -2922,17 +2967,21 @@ namespace {
 		// pointer and a window of its dwords, so the position fields can be
 		// identified from real values rather than guessed - which is what
 		// removes the "walk once" dependency.
-		PacketCapture::RoleProbe rp;
-		if (PacketCapture::GetRoleProbe(rp))
+		const uint32_t roleObj = CurrentRoleObject();
+		if (roleObj)
 		{
-			ImGui::TextDisabled("role @ 0x%08X", rp.self);
+			PacketCapture::RoleProbe rp;
+			const bool fromHook = PacketCapture::GetRoleProbe(rp);
+			ImGui::TextDisabled("role @ 0x%08X (%s)", roleObj,
+				(fromHook && rp.self == roleObj) ? "hook" : "global");
 
-			// The two coordinate pairs. The Process function builds them from
-			// (+0x468,+0x46C) and (+0x474,+0x478); which pair is X is settled
-			// by the values, since only one ordering lands both inside a map.
+			// The two coordinate pairs, as the client's own reader decodes
+			// them. (+0x468,+0x46C) is X and (+0x474,+0x478) is Y - proved
+			// from the disassembly, where the 468 pair is pushed as the
+			// sender's target-X argument and the 474 pair as target-Y.
 			uint32_t c1 = 0xFFFFFFFFu, c2 = 0xFFFFFFFFu;
-			const bool ok1 = DecodeCoord(rp.self, 0x468, 0x46C, c1);
-			const bool ok2 = DecodeCoord(rp.self, 0x474, 0x478, c2);
+			const bool ok1 = DecodeCoord(roleObj, 0x468, 0x46C, c1);
+			const bool ok2 = DecodeCoord(roleObj, 0x474, 0x478, c2);
 
 			if (ok1 && ok2)
 			{
@@ -2948,8 +2997,8 @@ namespace {
 				if (nowTick - lastRoleLogTick >= 1000)
 				{
 					lastRoleLogTick = nowTick;
-					HookLog("[Role] @0x%08X decoded %u / %u  (live action %s)",
-						rp.self, c1, c2, haveLive ? "yes" : "no");
+					HookLog("[Role] @0x%08X decoded X=%u Y=%u  (live action %s)",
+						roleObj, c1, c2, haveLive ? "yes" : "no");
 				}
 
 				// Feed the boxes from memory when there is no live move, which
@@ -2966,7 +3015,7 @@ namespace {
 			// Raw window, kept alongside the decode so a wrong formula is
 			// visible rather than hidden behind a plausible-looking number.
 			uint32_t words[4];
-			if (ReadRoleWords(rp.self, 0x468, words, 4))
+			if (ReadRoleWords(roleObj, 0x468, words, 4))
 				ImGui::TextDisabled("  raw +468: %08X %08X %08X %08X",
 					words[0], words[1], words[2], words[3]);
 		}
