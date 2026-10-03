@@ -1162,6 +1162,19 @@ namespace {
 		// honestly.
 		if (g_axisOrder == 0) return false;
 
+		// READ BEFORE WRITING, and require the read to make sense.
+		//
+		// This is the guard that matters. A successful read of a plausible
+		// coordinate proves the decoded pointer is a real address holding a
+		// real value - which is precisely the precondition for writing it
+		// back. Without it, a bad `a ^ k` lands somewhere real-but-wrong and
+		// corrupts state instead of faulting, which is what drops a
+		// connection. __try/__except cannot catch that; this can.
+		uint32_t curX = 0, curY = 0;
+		if (!DecodeCoord(self, 0x468, 0x46C, curX)) return false;
+		if (!DecodeCoord(self, 0x474, 0x478, curY)) return false;
+		if (curX > 4095 || curY > 4095) return false;   // not a map coordinate
+
 		const bool okX = (g_axisOrder == 1)
 			? EncodeCoord(self, 0x468, 0x46C, (uint32_t)x)
 			: EncodeCoord(self, 0x474, 0x478, (uint32_t)x);
