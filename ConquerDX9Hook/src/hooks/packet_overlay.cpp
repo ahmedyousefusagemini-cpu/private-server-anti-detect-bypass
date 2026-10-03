@@ -2392,9 +2392,24 @@ namespace {
 		{
 			const bool reached = (sp.x == g_moveToX && sp.y == g_moveToY);
 
-			HookLog("[Move] SERVER SAYS (%d,%d); asked (%d,%d) from (%d,%d) -> %s",
-				sp.x, sp.y, g_moveToX, g_moveToY, g_moveFromX, g_moveFromY,
-				reached ? "ACCEPTED" : "different position");
+			// Report WHOSE move the server echoed. RecordServerPos records any
+			// 0x0833 receive, so without this check a neighbouring player's
+			// move looks exactly like our own being accepted - which would
+			// make a rejected move look like a success.
+			PacketCapture::LastAction who;
+			const bool haveWho = PacketCapture::GetLastAction(who);
+			const bool ours = haveWho && (sp.id == who.id);
+
+			HookLog("[Move] SERVER SAYS (%d,%d) for character %u (ours: %s); "
+				"asked (%d,%d) from (%d,%d) -> %s",
+				sp.x, sp.y, sp.id, ours ? "yes" : "NO",
+				g_moveToX, g_moveToY, g_moveFromX, g_moveFromY,
+				!ours ? "ANOTHER PLAYER - not our move"
+					: (reached ? "ACCEPTED" : "different position"));
+
+			// A move by someone else proves nothing about ours. Do not report
+			// it as a result - keep waiting for our own echo.
+			if (!ours) return;
 
 			g_buildFlashUntil = (float)ImGui::GetTime() + 5.0f;
 			g_buildFlashError = !reached;
@@ -2452,6 +2467,11 @@ namespace {
 		{
 			g_moveFromX = live.targetX;
 			g_moveFromY = live.targetY;
+
+			// Only this character's moves count as an answer to our move.
+			// Everyone else on the map is moving too, and their broadcasts
+			// would otherwise be read as our own success.
+			PacketCapture::WatchCharacter(live.id);
 		}
 		else
 		{

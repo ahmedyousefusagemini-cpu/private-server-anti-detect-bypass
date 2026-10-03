@@ -181,6 +181,14 @@ namespace PacketCapture {
 
 	bool GetServerPos(ServerPos& out);
 
+	// Restricts the recorded server position to one character.
+	//
+	// A busy map has many players moving, and the server broadcasts all of
+	// them. Without this, "the last 0x0833 receive" is usually somebody
+	// else's move - which makes a rejected move look accepted. Pass 0 to
+	// record everyone again.
+	void WatchCharacter(uint32_t id);
+
 	// The CMyClientSocket* seen on the most recent outgoing send. Needed
 	// because DoSendMsg is __thiscall - the socket is the implicit `this`.
 	// Null until at least one packet has been sent this session.

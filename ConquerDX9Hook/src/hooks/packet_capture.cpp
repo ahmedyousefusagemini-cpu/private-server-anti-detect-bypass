@@ -97,6 +97,10 @@ namespace {
 	// accepted: the server echoes accepted moves back with the same layout.
 	ServerPos g_serverPos = {};
 
+	// When non-zero, only this character's moves are recorded. See
+	// WatchCharacter in the header.
+	uint32_t g_watchId = 0;
+
 	// The socket the most recent outgoing send travelled on. DoSendMsg is
 	// __thiscall, so `self` is the CMyClientSocket*; PacketSend needs it to
 	// re-issue a message. Games routinely recreate the socket on reconnect,
@@ -200,6 +204,13 @@ namespace {
 		// record with zeros and make a working move look like a failure.
 		if (!haveId || !haveX || !haveY || !haveMode) return;
 		if (mode != 137) return;
+
+		// On a busy map everyone's moves arrive here, and the last one to
+		// land is rarely ours. When a character is being watched, ignore the
+		// rest - otherwise a neighbour's move is read as our own being
+		// accepted, which is worse than no signal at all.
+		const uint32_t watchId = g_watchId;
+		if (watchId != 0 && id != watchId) return;
 
 		EnterCriticalSection(&g_lock);
 		g_serverPos.valid = true;
@@ -609,6 +620,15 @@ bool GetServerPos(ServerPos& out)
 	out = g_serverPos;
 	LeaveCriticalSection(&g_lock);
 	return out.valid;
+}
+
+// See packet_capture.h. 0 records everyone again.
+void WatchCharacter(uint32_t id)
+{
+	if (!g_lockReady) return;
+	EnterCriticalSection(&g_lock);
+	g_watchId = id;
+	LeaveCriticalSection(&g_lock);
 }
 
 void Install()
