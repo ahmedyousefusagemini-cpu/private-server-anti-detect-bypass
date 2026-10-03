@@ -2390,6 +2390,20 @@ namespace {
 	// BuildJumpGoal, which is what stamps the origin as well as the target.
 	void DoMoveToTarget()
 	{
+		// Log the attempt first, before anything can fail. Every later line is
+		// conditional, so without this a refused move is invisible in the log
+		// and "did not move" cannot be told from "never tried".
+		{
+			PacketCapture::LastAction probe;
+			const bool haveLive = PacketCapture::GetLastAction(probe);
+			HookLog("[Move] pressed - target (%d,%d), armed 0x%04X, template %d bytes, "
+				"live action %s%s",
+				g_walkX, g_walkY, (unsigned)g_walkMsgId, g_buildBodyBytes,
+				haveLive ? "yes" : "no",
+				haveLive ? "" : " (no move seen yet - the clock and origin fall back "
+					"to the capture)");
+		}
+
 		// Remember where we started. Without this the verifier could only say
 		// "some position changed", not "we reached the target we asked for".
 		PacketCapture::LastAction live;
@@ -2449,6 +2463,15 @@ namespace {
 			g_buildFlashError = true;
 			_snprintf_s(g_buildFlashText, _TRUNCATE,
 				"No fields %d/%d in this 0x%04X (%d bytes). Has: %s",
+				g_walkPosFieldX, g_walkPosFieldY, (unsigned)g_walkMsgId,
+				g_buildBodyBytes, have);
+
+			// Log it too. This branch used to only touch the panel, so a
+			// refused move left NO trace in the file - which makes "the
+			// character did not move" indistinguishable from "the button was
+			// never pressed" when reading the log afterwards.
+			HookLog("[Move] REFUSED - no fields %d/%d in this 0x%04X "
+				"(%d bytes). Has: %s",
 				g_walkPosFieldX, g_walkPosFieldY, (unsigned)g_walkMsgId,
 				g_buildBodyBytes, have);
 		}
