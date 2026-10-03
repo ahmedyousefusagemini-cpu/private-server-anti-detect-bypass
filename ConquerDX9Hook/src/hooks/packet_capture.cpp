@@ -43,6 +43,7 @@ namespace {
 	const uintptr_t kRvaDoSendMsg = 0x00E799A1u;   // absolute 0x012799A1
 	const uintptr_t kRvaGetMsgType = 0x0090C67Bu;  // absolute 0x00D0C67B
 	const uintptr_t kRvaActionSend = 0x00994FF5u;  // absolute 0x00D94FF5
+	const uintptr_t kRvaRoleProcess = 0x00AD2E14u; // absolute 0x00ED2E14
 
 	// Prologues, used to confirm the client build matches before hooking.
 	//   DoSendMsg : PUSH EBP; MOV EBP,ESP; SUB ESP,0Ch; PUSH EBX; PUSH ESI; PUSH EDI; MOV EDI,[EBP+8]
@@ -52,6 +53,10 @@ namespace {
 	//   ActionSend: PUSH EBP; MOV EBP,ESP; PUSH EBX; PUSH ESI; MOV ESI,[EBP+8]; PUSH EDI; MOV EDI,ECX; TEST ESI,ESI
 	//   Stopped before the following JZ so no relative offset is baked in.
 	const uint8_t kSigActionSend[] = { 0x55, 0x8B, 0xEC, 0x53, 0x56, 0x8B, 0x75, 0x08, 0x57, 0x8B, 0xF9, 0x85, 0xF6 };
+	//   RoleProcess: PUSH 0x4C8; MOV EAX,<EH handler>; CALL __EH_prolog3  (the
+	//   MSVC EH-prolog pattern, so the immediate is the frame size and stays
+	//   stable for this build).
+	const uint8_t kSigRoleProcess[] = { 0x68, 0xC8, 0x04, 0x00, 0x00, 0xB8, 0xF9, 0x93, 0x49, 0x01 };
 
 	// Never read more than this from a claimed packet length.
 	const uint32_t kHardMaxLength = 2048;
@@ -75,9 +80,21 @@ namespace {
 		int a2, int a3, int a4, int a5, int a6,
 		int a7, int a8, int a9, int a10, int a11);
 
+	// The role Process function. __thiscall, so its `this` is the role object
+	// - the pointer needed to read the character's position from memory
+	// instead of waiting for it to move.
+	typedef void(__fastcall* RoleProcessFn)(void* self, void* edx);
+
 	DoSendMsgFn g_realDoSendMsg = nullptr;
 	GetMsgTypeFn g_realGetMsgType = nullptr;
 	ActionSendFn g_realActionSend = nullptr;
+	RoleProcessFn g_realRoleProcess = nullptr;
+
+	// Written on every Process call, read by the overlay. One pointer store,
+	// no memory reads inside the hook: this runs per role per frame, so it has
+	// to stay trivial.
+	void* volatile g_roleSelf = nullptr;
+	uint32_t volatile g_roleSelfTick = 0;
 
 	// Last argument vector logged, so a burst of identical actions collapses
 	// to one line instead of flooding the log. A move still logs each step
@@ -574,6 +591,20 @@ namespace {
 			a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
 	}
 
+	// The role Process function. Deliberately does almost nothing: it records
+	// the `this` pointer and forwards the call. Everything else (reading the
+	// position out of that object) happens in the overlay, once per frame,
+	// rather than per role per frame here.
+	void __fastcall HookedRoleProcess(void* self, void* /*unusedEdx*/)
+	{
+		if (self)
+		{
+			g_roleSelf = self;
+			g_roleSelfTick = GetTickCount();
+		}
+		g_realRoleProcess(self, nullptr);
+	}
+
 
 	// -----------------------------------------------------------------------
 	// Install helpers
@@ -620,6 +651,21 @@ bool GetServerPos(ServerPos& out)
 	out = g_serverPos;
 	LeaveCriticalSection(&g_lock);
 	return out.valid;
+}
+
+// Copies the role object pointer captured by the Process hook. See
+// packet_capture.h: this is what makes the position readable without moving.
+bool GetRoleProbe(RoleProbe& out)
+{
+	out = RoleProbe();
+
+	void* self = g_roleSelf;
+	if (!self) return false;
+
+	out.valid = true;
+	out.self = (uint32_t)(uintptr_t)self;
+	out.tick = g_roleSelfTick;
+	return true;
 }
 
 // See packet_capture.h. 0 records everyone again.
@@ -699,6 +745,20 @@ void Install()
 	else
 	{
 		HookLog("[Capture] ACTION signature mismatch at %p - client build differs, hook skipped", (void*)actionSend);
+	}
+
+	// The role Process function. Also observational - it records a pointer and
+	// forwards, so a mismatch costs a log line, not behaviour.
+	uintptr_t roleProcess = base + kRvaRoleProcess;
+	if (SignatureMatches(roleProcess, kSigRoleProcess, sizeof(kSigRoleProcess)))
+	{
+		MH_STATUS st = MH_CreateHook((LPVOID)roleProcess, (LPVOID)HookedRoleProcess, (LPVOID*)&g_realRoleProcess);
+		if (st == MH_OK) { MH_EnableHook((LPVOID)roleProcess); HookLog("[Capture] ROLE hook installed"); }
+		else HookLog("[Capture] ROLE hook failed %d", st);
+	}
+	else
+	{
+		HookLog("[Capture] ROLE signature mismatch at %p - client build differs, hook skipped", (void*)roleProcess);
 	}
 }
 

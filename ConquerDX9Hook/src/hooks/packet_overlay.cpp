@@ -969,6 +969,28 @@ namespace {
 		return (dx > 0) ? 6 : 2;                   // east / west
 	}
 
+	// Reads dwords out of the role object.
+	//
+	// Guarded because the pointer comes from a hook: if the object is freed or
+	// the offset is wrong, this must fail quietly rather than take the client
+	// down inside the render loop.
+	bool ReadRoleWords(uint32_t self, int base, uint32_t* out, int count)
+	{
+		if (!self || !out || count <= 0) return false;
+
+		__try
+		{
+			const uint8_t* p = (const uint8_t*)(uintptr_t)self;
+			for (int i = 0; i < count; ++i)
+				out[i] = *(const uint32_t*)(p + base + i * 4);
+			return true;
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+			return false;
+		}
+	}
+
 	// Writes a complete 0x0833 move body from scratch.
 	//
 	// This replaces editing a captured template, which was the wrong design.
@@ -2722,6 +2744,34 @@ namespace {
 		if (!haveLive)
 			Caption("No live move seen yet - walk once so the clock and "
 				"origin come from the client instead of the capture.");
+
+		// Role probe. The ACTION hook can only report a position after a move;
+		// the character object holds it all the time. This shows the object
+		// pointer and a window of its dwords, so the position fields can be
+		// identified from real values rather than guessed - which is what
+		// removes the "walk once" dependency.
+		PacketCapture::RoleProbe rp;
+		if (PacketCapture::GetRoleProbe(rp))
+		{
+			ImGui::TextDisabled("role @ 0x%08X", rp.self);
+
+			uint32_t words[8];
+			if (ReadRoleWords(rp.self, 0x468, words, 8))
+			{
+				// +0x468..+0x487 is the range the role Process function reads
+				// its position from. Printed raw: the encoding is not known
+				// yet, and showing guesses as if they were coordinates would
+				// be worse than showing the bytes.
+				ImGui::TextDisabled("  +468: %08X %08X  %08X %08X",
+					words[0], words[1], words[2], words[3]);
+				ImGui::TextDisabled("  +478: %08X %08X  %08X %08X",
+					words[4], words[5], words[6], words[7]);
+			}
+			else
+				Caption("role object unreadable");
+		}
+		else
+			Caption("role object not seen yet - the ROLE hook has not fired.");
 
 		if (g_walkHasGoal)
 		{

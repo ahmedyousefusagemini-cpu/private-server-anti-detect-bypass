@@ -181,6 +181,24 @@ namespace PacketCapture {
 
 	bool GetServerPos(ServerPos& out);
 
+	// ---- the role object pointer -----------------------------------------
+	//
+	// The ACTION hook learns the position from moves, so it has nothing to
+	// report until the character has moved at least once. Reading the position
+	// from the role object instead works every frame, with no movement at all
+	// - but it needs the pointer, which is what this provides.
+	//
+	// The role Process function is __thiscall and its `this` IS the role
+	// object, so a detour on it yields the pointer for free.
+	struct RoleProbe
+	{
+		bool     valid;
+		uint32_t self;      // the role object address
+		uint32_t tick;      // GetTickCount() when last seen
+	};
+
+	bool GetRoleProbe(RoleProbe& out);
+
 	// Restricts the recorded server position to one character.
 	//
 	// A busy map has many players moving, and the server broadcasts all of
