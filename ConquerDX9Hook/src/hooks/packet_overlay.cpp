@@ -1825,6 +1825,35 @@ namespace {
 					g_walkX = (int)px;
 					g_walkY = (int)py;
 				}
+
+				// Log here too, not only from the Packets tab.
+				//
+				// Only the ACTIVE tab's body is drawn, so the probe on the
+				// Move row never runs while the Map tab is open - which is
+				// why the log stayed empty even after it was made
+				// unconditional. Whatever the user is looking at has to be
+				// the thing that reports.
+				static uint32_t lastPosLogTick = 0;
+				const uint32_t t = GetTickCount();
+				if (t - lastPosLogTick >= 2000)
+				{
+					lastPosLogTick = t;
+
+					uint32_t a1 = 0, k1 = 0, a2 = 0, k2 = 0;
+					ReadRoleWords(obj, 0x468, &a1, 1);
+					ReadRoleWords(obj, 0x46C, &k1, 1);
+					ReadRoleWords(obj, 0x474, &a2, 1);
+					ReadRoleWords(obj, 0x478, &k2, 1);
+
+					PacketCapture::RoleProbe probe;
+					const bool hooked = PacketCapture::GetRoleProbe(probe);
+
+					HookLog("[Pos] obj=0x%08X (hook=%s self=0x%08X global=0x%08X) | "
+						"A1=%08X K1=%08X A2=%08X K2=%08X | %s -> X=%u Y=%u",
+						obj, hooked ? "yes" : "no", hooked ? probe.self : 0,
+						GetHeroObject(), a1, k1, a2, k2,
+						sane ? "ok" : "NOT SANE", px, py);
+				}
 			}
 		}
 	}
