@@ -252,6 +252,10 @@ namespace {
 	// box turns it off, so a hand-entered target is not overwritten.
 	bool   g_walkFollow = true;
 
+	// Tiles the Map tab's "Jump X+20" button steps east. The client's own
+	// moves routinely cover 10-14 tiles, so 20 is within normal traffic.
+	const int kJumpStepX = 20;
+
 	// Move verification.
 	//
 	// A send that returns 0 only means the client accepted the bytes - it
@@ -1599,19 +1603,19 @@ namespace {
 			// The starting point comes from the ACTION hook, so this is
 			// relative to the character's real position rather than to a
 			// stale capture - pressing it repeatedly walks east 5 at a time.
-			if (ImGui::Button("Jump X+5"))
+			if (ImGui::Button("Jump X+20"))
 			{
 				PacketCapture::LastAction live;
 				if (PacketCapture::GetLastAction(live))
 				{
-					g_walkX = live.targetX + 5;
+					g_walkX = live.targetX + kJumpStepX;
 					g_walkY = live.targetY;
 				}
 				else
 				{
 					// No live fix yet - step from whatever is in the box so
 					// the button still does something predictable.
-					g_walkX += 5;
+					g_walkX += kJumpStepX;
 				}
 				DoMoveToTarget();
 			}
