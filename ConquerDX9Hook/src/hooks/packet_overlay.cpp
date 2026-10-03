@@ -991,6 +991,45 @@ namespace {
 		}
 	}
 
+	// Decodes one coordinate out of the role object.
+	//
+	// The client does not store the position plainly. The role Process
+	// function computes it as:
+	//
+	//     ptr   = *(p + offA) ^ *(p + offK)      // an XOR-encoded pointer
+	//     value = *ptr ^ *(p + offK)             // value XORed with the key
+	//
+	// i.e. two dwords hold (encoded pointer, key), and the coordinate lives at
+	// the address they decode to, still XORed with the key. That is why the
+	// raw window shows nothing that looks like a coordinate - it is not
+	// stored as one.
+	//
+	// A zero first half means "no value", which the client represents as
+	// 0xFFFFFFFF rather than reading through a null pointer.
+	//
+	// Guarded: the decoded address is arbitrary, so a wrong offset must fail
+	// quietly rather than fault inside the render loop.
+	bool DecodeCoord(uint32_t self, int offA, int offK, uint32_t& out)
+	{
+		out = 0xFFFFFFFFu;
+		if (!self) return false;
+
+		__try
+		{
+			const uint8_t* p = (const uint8_t*)(uintptr_t)self;
+			const uint32_t a = *(const uint32_t*)(p + offA);
+			const uint32_t k = *(const uint32_t*)(p + offK);
+
+			if (a == 0) return true;                  // no value
+			out = *(const uint32_t*)(uintptr_t)(a ^ k) ^ k;
+			return true;
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+			return false;
+		}
+	}
+
 	// Writes a complete 0x0833 move body from scratch.
 	//
 	// This replaces editing a captured template, which was the wrong design.
@@ -2755,20 +2794,46 @@ namespace {
 		{
 			ImGui::TextDisabled("role @ 0x%08X", rp.self);
 
-			uint32_t words[8];
-			if (ReadRoleWords(rp.self, 0x468, words, 8))
+			// The two coordinate pairs. The Process function builds them from
+			// (+0x468,+0x46C) and (+0x474,+0x478); which pair is X is settled
+			// by the values, since only one ordering lands both inside a map.
+			uint32_t c1 = 0xFFFFFFFFu, c2 = 0xFFFFFFFFu;
+			const bool ok1 = DecodeCoord(rp.self, 0x468, 0x46C, c1);
+			const bool ok2 = DecodeCoord(rp.self, 0x474, 0x478, c2);
+
+			if (ok1 && ok2)
 			{
-				// +0x468..+0x487 is the range the role Process function reads
-				// its position from. Printed raw: the encoding is not known
-				// yet, and showing guesses as if they were coordinates would
-				// be worse than showing the bytes.
-				ImGui::TextDisabled("  +468: %08X %08X  %08X %08X",
-					words[0], words[1], words[2], words[3]);
-				ImGui::TextDisabled("  +478: %08X %08X  %08X %08X",
-					words[4], words[5], words[6], words[7]);
+				ImGui::TextDisabled("  decoded: %u / %u", c1, c2);
+
+				// Log it too, once a second. The panel is the live view; the
+				// log is what survives a session and can be compared against
+				// the coordinates the game itself shows.
+				static uint32_t lastRoleLogTick = 0;
+				const uint32_t nowTick = GetTickCount();
+				if (nowTick - lastRoleLogTick >= 1000)
+				{
+					lastRoleLogTick = nowTick;
+					HookLog("[Role] @0x%08X decoded %u / %u  (live action %s)",
+						rp.self, c1, c2, haveLive ? "yes" : "no");
+				}
+
+				// Feed the boxes from memory when there is no live move, which
+				// is what removes the "walk once" dependency entirely.
+				if (g_walkFollow && !haveLive && c1 <= 4095 && c2 <= 4095)
+				{
+					g_walkX = (int)c1;
+					g_walkY = (int)c2;
+				}
 			}
 			else
-				Caption("role object unreadable");
+				Caption("position fields unreadable");
+
+			// Raw window, kept alongside the decode so a wrong formula is
+			// visible rather than hidden behind a plausible-looking number.
+			uint32_t words[4];
+			if (ReadRoleWords(rp.self, 0x468, words, 4))
+				ImGui::TextDisabled("  raw +468: %08X %08X %08X %08X",
+					words[0], words[1], words[2], words[3]);
 		}
 		else
 			Caption("role object not seen yet - the ROLE hook has not fired.");
