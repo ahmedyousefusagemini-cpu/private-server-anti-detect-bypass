@@ -252,9 +252,17 @@ namespace {
 	// box turns it off, so a hand-entered target is not overwritten.
 	bool   g_walkFollow = true;
 
-	// Tiles the Map tab's "Jump X+20" button steps east. The client's own
-	// moves routinely cover 10-14 tiles, so 20 is within normal traffic.
-	const int kJumpStepX = 20;
+	// Tiles the Map tab's "Jump X+15" button steps east.
+	const int kJumpStepX = 15;
+
+	// Whether to write the accepted position back into the client object.
+	//
+	// OFF by default, and deliberately so. The write is the only thing here
+	// that modifies the client's own state, and an unproven write into a live
+	// object is exactly what can drop the connection. Until the axis order is
+	// calibrated and a write is observed to be safe, the safe default is to
+	// leave the client alone - the server still moves us either way.
+	bool g_resyncClient = false;
 
 	// Move verification.
 	//
@@ -1554,7 +1562,7 @@ namespace {
 	// Tab: Map  (the template's default look)
 	// -----------------------------------------------------------------------
 	// Defined with the packet builder further down. Declared here because the
-	// Map tab's "Jump X+20" button runs a move, and this tab is drawn well
+	// Map tab's "Jump X+15" button runs a move, and this tab is drawn well
 	// before the builder in the file.
 	void DoMoveToTarget();
 
@@ -1603,7 +1611,7 @@ namespace {
 			// The starting point comes from the ACTION hook, so this is
 			// relative to the character's real position rather than to a
 			// stale capture - pressing it repeatedly walks east 5 at a time.
-			if (ImGui::Button("Jump X+20"))
+			if (ImGui::Button("Jump X+15"))
 			{
 				PacketCapture::LastAction live;
 				if (PacketCapture::GetLastAction(live))
@@ -2672,14 +2680,23 @@ namespace {
 					g_walkGoalBytes, (unsigned)g_walkGoalMsgId);
 
 				// The server will move us, but the client ignores position
-				// updates for its own character - so write the new position
-				// into the object too, or the two drift apart and the next
-				// move is sent from a stale origin.
-				if (ResyncClientPosition(g_moveToX, g_moveToY))
+				// updates for its own character, so the two drift apart. The
+				// write that fixes that is gated: it modifies live client
+				// state, and until it has been proven safe it stays off.
+				if (!g_resyncClient)
+				{
+					HookLog("[Move] client resync disabled (server moved us; "
+						"the client will follow on its own)");
+				}
+				else if (ResyncClientPosition(g_moveToX, g_moveToY))
+				{
 					HookLog("[Move] client resynced to (%d,%d)", g_moveToX, g_moveToY);
+				}
 				else
+				{
 					HookLog("[Move] client NOT resynced (axis order not calibrated "
 						"yet - move once by hand so it can be worked out)");
+				}
 			}
 			else
 			{
@@ -2831,6 +2848,16 @@ namespace {
 		// real position; off to keep a target you typed.
 		ImGui::SameLine();
 		ImGui::Checkbox("follow##jumpcell", &g_walkFollow);
+
+		// Off by default. This is the only control here that writes into the
+		// live client object, and an unproven write is what can drop the
+		// connection - so it is opt-in and clearly labelled.
+		ImGui::SameLine();
+		ImGui::Checkbox("resync##jumpcell", &g_resyncClient);
+		if (ImGui::IsItemHovered())
+			ImGui::SetTooltip("Write the accepted position into the client object.\n"
+				"Off by default: this modifies live client state and can\n"
+				"disconnect if the axis order is wrong.");
 
 		ImGui::SameLine();
 		ImGui::SetNextItemWidth(55.0f);
