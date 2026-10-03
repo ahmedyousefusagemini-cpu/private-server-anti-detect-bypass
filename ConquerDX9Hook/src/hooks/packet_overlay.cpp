@@ -1853,6 +1853,29 @@ namespace {
 						obj, hooked ? "yes" : "no", hooked ? probe.self : 0,
 						GetHeroObject(), a1, k1, a2, k2,
 						sane ? "ok" : "NOT SANE", px, py);
+
+					// Wide dump of the object.
+					//
+					// The decoded pair is only populated once the client has
+					// moved, so +0x468 is a copy written for the move message,
+					// not the primary position. The primary one has to be
+					// somewhere else in this object, and the only way to find
+					// it is to look - so dump a window and diff it across a
+					// move. The fields that change ARE the position.
+					if (obj)
+					{
+						uint32_t win[32];
+						if (ReadRoleWords(obj, 0x3C0, win, 32))
+						{
+							for (int r = 0; r < 4; ++r)
+							{
+								HookLog("[Pos] +%03X: %08X %08X %08X %08X  %08X %08X %08X %08X",
+									0x3C0 + r * 32,
+									win[r * 8 + 0], win[r * 8 + 1], win[r * 8 + 2], win[r * 8 + 3],
+									win[r * 8 + 4], win[r * 8 + 5], win[r * 8 + 6], win[r * 8 + 7]);
+							}
+						}
+					}
 				}
 			}
 		}
