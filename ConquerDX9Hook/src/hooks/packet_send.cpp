@@ -197,6 +197,40 @@ bool CanSend(uint16_t messageId)
 // ---------------------------------------------------------------------------
 // Send side
 // ---------------------------------------------------------------------------
+// Logs one outgoing injected packet to hook_init.log.
+//
+// This is NOT redundant with the capture hook. SendSlot calls the MinHook
+// trampoline (RealDoSendMsg), which is the ORIGINAL function body and so
+// bypasses HookedDoSendMsg entirely. Injected packets therefore never appear
+// in packets.log, and without this line there is no way to see what we
+// actually put on the wire - which makes "the send reported ok but the
+// character did not move" impossible to diagnose.
+//
+// The format matches the capture's, so the two can be compared directly.
+void LogInjected(const uint8_t* packet, int length)
+{
+	if (!packet || length < 4) return;
+
+	static const char* kDigits = "0123456789ABCDEF";
+	char hex[3 * 128 + 4];
+	size_t n = 0;
+
+	const int shown = (length < 128) ? length : 128;
+	for (int i = 0; i < shown; ++i)
+	{
+		if (n + 4 >= sizeof(hex)) break;
+		hex[n++] = kDigits[(packet[i] >> 4) & 0xF];
+		hex[n++] = kDigits[packet[i] & 0xF];
+		hex[n++] = ' ';
+	}
+	if (n) --n;                     // drop the trailing space
+	hex[n] = '\0';
+
+	HookLog("[Send] INJECTED len=%d id=0x%04X  %s%s", length,
+		(unsigned)(packet[2] | (packet[3] << 8)), hex,
+		(length > shown) ? " ..." : "");
+}
+
 int SendSlot(uint16_t messageId, const uint8_t* bodyOverride, int bodyOverrideBytes)
 {
 	EnsureLock();
@@ -272,6 +306,10 @@ int SendSlot(uint16_t messageId, const uint8_t* bodyOverride, int bodyOverrideBy
 	}
 
 	InterlockedIncrement(&g_totalSent);
+
+	// Record what is actually going out, before it goes out - if the send
+	// faults we still want to see the bytes we tried.
+	LogInjected(out, length);
 
 	int result = 0;
 	__try
