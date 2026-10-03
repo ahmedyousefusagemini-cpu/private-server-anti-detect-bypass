@@ -707,6 +707,32 @@ void Install()
 	uintptr_t doSendMsg = base + kRvaDoSendMsg;
 	uintptr_t getMsgType = base + kRvaGetMsgType;
 
+	// Stamp this DLL's own write time into the log.
+	//
+	// Every "is the new build actually running?" question has cost a round
+	// trip this session - several tests were run against a DLL built seconds
+	// before the fix. With the build time written at startup, one glance at
+	// the log answers it and no external timestamp comparison is needed.
+	{
+		char selfPath[MAX_PATH] = { 0 };
+		if (GetModuleFileNameA((HMODULE)exeModule, selfPath, MAX_PATH))
+		{
+			WIN32_FILE_ATTRIBUTE_DATA fad;
+			if (GetFileAttributesExA(selfPath, GetFileExInfoStandard, &fad))
+			{
+				FILETIME local = { 0 };
+				SYSTEMTIME st = { 0 };
+				if (FileTimeToLocalFileTime(&fad.ftLastWriteTime, &local) &&
+					FileTimeToSystemTime(&local, &st))
+				{
+					HookLog("[Build] DLL written %04d-%02d-%02d %02d:%02d:%02d",
+						st.wYear, st.wMonth, st.wDay,
+						st.wHour, st.wMinute, st.wSecond);
+				}
+			}
+		}
+	}
+
 	HookLog("[Capture] base %p  DoSendMsg %p  GetMsgType %p", (void*)base, (void*)doSendMsg, (void*)getMsgType);
 	HookLog("[Capture] log %s (file=%d, filebytes=%u, overlay=%d)",
 		g_logPath, g_fileLog ? 1 : 0, g_fileBytes, g_overlayStartup ? 1 : 0);

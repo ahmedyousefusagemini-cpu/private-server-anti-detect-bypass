@@ -255,6 +255,23 @@ namespace {
 	// Tiles the Map tab's "Jump X+15" button steps east.
 	const int kJumpStepX = 15;
 
+	// ---- object viewer -----------------------------------------------------
+	//
+	// A snapshot-and-diff view of the character object, in the overlay.
+	//
+	// This exists because the log round trip is the real bottleneck: dump ->
+	// copy -> send -> read -> reply is minutes per iteration, and every guess
+	// costs one. Snapshotting in the overlay collapses that to a single click:
+	// snapshot, walk one step, and the fields that moved light up on screen.
+	//
+	// Same method as reading the log, minus the waiting.
+	bool     g_objViewOpen = false;
+	int      g_objViewBase = 0x3C0;      // first offset shown
+	int      g_objViewCount = 48;        // dwords shown
+	uint32_t g_objSnap[64] = {};         // snapshot values
+	bool     g_objSnapValid = false;
+	uint32_t g_objSnapObj = 0;
+
 	// Whether to write the accepted position back into the client object.
 	//
 	// OFF by default, and deliberately so. The write is the only thing here
@@ -1824,6 +1841,74 @@ namespace {
 				{
 					g_walkX = (int)px;
 					g_walkY = (int)py;
+				}
+
+				// ---- object viewer ----------------------------------------
+				//
+				// Snapshot the object, walk one step, and whatever changed is
+				// the field we are looking for. This is the same method as
+				// diffing the log, except the answer appears on screen in one
+				// click instead of after a rebuild-and-report round trip.
+				ImGui::Spacing();
+				if (ImGui::CollapsingHeader("Object viewer - find a field"))
+				{
+					if (!obj)
+					{
+						ImGui::TextDisabled("no character object");
+					}
+					else
+					{
+						ImGui::SetNextItemWidth(70.0f);
+						ImGui::InputInt("base##obj", &g_objViewBase, 4, 16,
+							ImGuiInputTextFlags_CharsHexadecimal);
+						if (g_objViewBase < 0) g_objViewBase = 0;
+
+						ImGui::SameLine();
+						ImGui::SetNextItemWidth(60.0f);
+						ImGui::InputInt("count##obj", &g_objViewCount, 4, 16);
+						if (g_objViewCount < 4) g_objViewCount = 4;
+						if (g_objViewCount > 64) g_objViewCount = 64;
+
+						ImGui::SameLine();
+						if (ImGui::Button("Snapshot"))
+						{
+							if (ReadRoleWords(obj, g_objViewBase, g_objSnap, g_objViewCount))
+							{
+								g_objSnapValid = true;
+								g_objSnapObj = obj;
+							}
+						}
+						ImGui::SameLine();
+						if (ImGui::Button("Clear")) g_objSnapValid = false;
+
+						ImGui::SameLine();
+						ImGui::TextDisabled(g_objSnapValid
+							? "now move one step - changed fields glow"
+							: "snapshot, then move one step");
+
+						uint32_t cur[64];
+						if (ReadRoleWords(obj, g_objViewBase, cur, g_objViewCount))
+						{
+							ImGui::BeginChild("##objwin", ImVec2(0.0f, 150.0f), true);
+							for (int i = 0; i < g_objViewCount; ++i)
+							{
+								const bool changed = g_objSnapValid
+									&& g_objSnapObj == obj
+									&& cur[i] != g_objSnap[i];
+
+								char line[64];
+								_snprintf_s(line, _TRUNCATE, "+%03X  %08X",
+									g_objViewBase + i * 4, cur[i]);
+
+								if (changed)
+									ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.20f, 1.0f),
+										"%s   was %08X", line, g_objSnap[i]);
+								else
+									ImGui::TextDisabled("%s", line);
+							}
+							ImGui::EndChild();
+						}
+					}
 				}
 
 				// Log here too, not only from the Packets tab.
