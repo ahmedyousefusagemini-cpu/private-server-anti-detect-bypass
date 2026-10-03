@@ -87,6 +87,101 @@ namespace {
 	DWORD g_lastActionLogTick = 0;
 	const DWORD kActionLogRepeatMs = 1000;
 
+	// The last action, kept for the builder. Guarded by g_lock: the hook runs
+	// on the game thread and the overlay reads it from the render thread, and
+	// a torn timestamp would be worse than no timestamp.
+	LastAction g_lastAction = {};
+
+	// The last position the server reported for a character, parsed out of a
+	// 0x0833 RECV. This is what tells us whether an injected move was
+	// accepted: the server echoes accepted moves back with the same layout.
+	ServerPos g_serverPos = {};
+
+	// Minimal varint walker, receive side. The overlay has a fuller one, but
+	// it lives in a different translation unit and this only needs the four
+	// fields that matter (id, target x/y, mode).
+	bool ReadRecvField(const uint8_t* p, int size, int& offset,
+		int& fieldNumber, uint64_t& value)
+	{
+		if (!p || offset < 0 || offset >= size) return false;
+
+		uint64_t tag = 0;
+		int shift = 0;
+		int i = offset;
+		while (i < size && shift <= 63)
+		{
+			const uint8_t byte = p[i++];
+			tag |= (uint64_t)(byte & 0x7F) << shift;
+			if (!(byte & 0x80)) break;
+			shift += 7;
+		}
+		if (i > offset && (p[i - 1] & 0x80)) return false;   // ran off the end
+
+		fieldNumber = (int)(tag >> 3);
+		if (fieldNumber <= 0) return false;
+		if ((tag & 0x07) != 0) return false;                 // varints only
+
+		uint64_t v = 0;
+		shift = 0;
+		while (i < size && shift <= 63)
+		{
+			const uint8_t byte = p[i++];
+			v |= (uint64_t)(byte & 0x7F) << shift;
+			if (!(byte & 0x80))
+			{
+				value = v;
+				offset = i;
+				return true;
+			}
+			shift += 7;
+		}
+		return false;
+	}
+
+	// Pulls id / target x / target y / mode out of a 0x0833 receive and stores
+	// it. The wire layout is [u16 len][u16 id][protobuf], so the walk starts
+	// at byte 4.
+	void RecordServerPos(const uint8_t* packet, int length)
+	{
+		if (!packet || length < 8) return;
+
+		uint32_t id = 0;
+		int x = 0, y = 0, mode = 0;
+		bool haveId = false, haveX = false, haveY = false, haveMode = false;
+
+		int offset = 4;
+		while (offset < length)
+		{
+			int f = 0;
+			uint64_t v = 0;
+			if (!ReadRecvField(packet, length, offset, f, v)) break;
+
+			switch (f)
+			{
+			case 1:  id = (uint32_t)v;      haveId = true;   break;
+			case 7:  x = (int)v;            haveX = true;    break;
+			case 8:  y = (int)v;            haveY = true;    break;
+			case 12: mode = (int)v;         haveMode = true; break;
+			default: break;
+			}
+		}
+
+		// Only a move carries a position. Anything else would overwrite the
+		// record with zeros and make a working move look like a failure.
+		if (!haveId || !haveX || !haveY || !haveMode) return;
+		if (mode != 137) return;
+
+		EnterCriticalSection(&g_lock);
+		g_serverPos.valid = true;
+		g_serverPos.id = id;
+		g_serverPos.x = x;
+		g_serverPos.y = y;
+		g_serverPos.mode = mode;
+		g_serverPos.tick = GetTickCount();
+		g_serverPos.seq = g_total;
+		LeaveCriticalSection(&g_lock);
+	}
+
 	// The socket the most recent outgoing send travelled on. DoSendMsg is
 	// __thiscall, so `self` is the CMyClientSocket*; PacketSend needs it to
 	// re-issue a message. Games routinely recreate the socket on reconnect,
@@ -385,6 +480,12 @@ namespace {
 			__try
 			{
 				Push(DirectionRecv, packet, (uint32_t)len);
+
+				// A 0x0833 receive is the server telling us where someone
+				// is. Recording it is how a sent move gets verified: if the
+				// server echoes our target back, it accepted the move.
+				if (len >= 4 && packet[2] == 0x33 && packet[3] == 0x08)
+					RecordServerPos(packet, (int)len);
 			}
 			__except (EXCEPTION_EXECUTE_HANDLER)
 			{
@@ -429,9 +530,32 @@ namespace {
 				a2, a3, a4, a5, a6, a7, a8, (unsigned)a9, a10, a11);
 		}
 
+		// Keep the last action for the builder. Only a move (mode 137) is
+		// worth keeping: it is the only shape that carries a position, so
+		// anything else would give the builder a bogus "current position".
+		// The clock is recorded alongside GetTickCount() so the reader can
+		// age it forward - a captured clock is already stale by the time
+		// anyone uses it.
+		if (a6 == 137)
+		{
+			EnterCriticalSection(&g_lock);
+			g_lastAction.valid = true;
+			g_lastAction.id = (uint32_t)a2;
+			g_lastAction.originX = a3;
+			g_lastAction.originY = a4;
+			g_lastAction.dir = a5;
+			g_lastAction.mode = a6;
+			g_lastAction.targetX = a7;
+			g_lastAction.targetY = a8;
+			g_lastAction.clock = (uint32_t)a9;
+			g_lastAction.capturedTick = GetTickCount();
+			LeaveCriticalSection(&g_lock);
+		}
+
 		return g_realActionSend(self, nullptr,
 			a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
 	}
+
 
 	// -----------------------------------------------------------------------
 	// Install helpers
@@ -447,6 +571,29 @@ namespace {
 			return false;
 		}
 	}
+}
+
+// Copies the last move the client sent itself. See packet_capture.h for why
+// the builder needs it: a replayed capture carries a stale clock and a stale
+// origin, and a server that checks either will drop the move.
+bool GetLastAction(LastAction& out)
+{
+	EnsureLock();
+	EnterCriticalSection(&g_lock);
+	out = g_lastAction;
+	LeaveCriticalSection(&g_lock);
+	return out.valid;
+}
+
+// Copies the last position the server reported for a character. See
+// packet_capture.h: this is the end-to-end check on whether a move worked.
+bool GetServerPos(ServerPos& out)
+{
+	EnsureLock();
+	EnterCriticalSection(&g_lock);
+	out = g_serverPos;
+	LeaveCriticalSection(&g_lock);
+	return out.valid;
 }
 
 void Install()

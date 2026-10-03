@@ -241,10 +241,27 @@ namespace {
 	int    g_walkPosFieldY = 8;                    // f8 = target Y
 	int    g_walkOriginFieldX = 14;                // f14 = origin X
 	int    g_walkOriginFieldY = 15;                // f15 = origin Y
+	int    g_walkClockField = 9;                   // f9  = client clock (ms)
+	bool   g_walkStampClock = true;                // refresh f9 to now on each move
 	int    g_walkX = 0;                            // target, in map cells
 	int    g_walkY = 0;
 	char   g_walkTargetText[64] = "";              // typed "x,y" for the quick box
 	bool   g_walkStampOrigin = true;               // also rewrite f14/f15 from the capture
+
+	// Move verification.
+	//
+	// A send that returns 0 only means the client accepted the bytes - it
+	// says nothing about whether the SERVER did. The only end-to-end proof is
+	// the server echoing the new position back, so after each move we watch
+	// the 0x0833 receive stream for it and log the verdict either way.
+	//
+	// Without this, "the character did not move" is indistinguishable from
+	// "the move was never accepted", which is exactly the state we were in.
+	bool     g_movePending = false;
+	int      g_moveFromX = 0, g_moveFromY = 0;
+	int      g_moveToX = 0, g_moveToY = 0;
+	uint32_t g_moveSentTick = 0;
+	uint32_t kMoveVerifyMs = 3000;
 
 	// Where the jump lands is decided here, so the builder tab can show it.
 	bool     g_walkHasGoal = false;
@@ -950,10 +967,27 @@ namespace {
 			if (!LoadBuilderTemplate(g_walkMsgId, false)) return false;
 		}
 
-		// Read the "here" estimate BEFORE overwriting the target.
+		// Where the character is NOW. The ACTION hook knows: it saw the last
+		// move the client sent itself, and that move's target is where the
+		// character ended up. The capture's own target is only a fallback -
+		// it is wherever the character stood when the packet was recorded,
+		// which may be a long walk ago.
 		int curX = 0, curY = 0;
-		const bool haveCur = ReadMoveTarget(g_buildBody, g_buildBodyBytes,
-			g_walkPosFieldX, g_walkPosFieldY, curX, curY);
+		bool haveCur = false;
+
+		PacketCapture::LastAction live;
+		const bool haveLive = PacketCapture::GetLastAction(live);
+		if (haveLive)
+		{
+			curX = live.targetX;
+			curY = live.targetY;
+			haveCur = true;
+		}
+		else
+		{
+			haveCur = ReadMoveTarget(g_buildBody, g_buildBodyBytes,
+				g_walkPosFieldX, g_walkPosFieldY, curX, curY);
+		}
 
 		// Destination first, then origin - each write can change the body
 		// length, so every call takes the current cursor.
@@ -974,6 +1008,28 @@ namespace {
 
 			n = SetFieldValue(g_buildBody, g_buildBodyBytes,
 				g_walkOriginFieldY, (uint64_t)curY);
+			if (n < 0) return false;
+			g_buildBodyBytes = n;
+		}
+
+		// Refresh the clock.
+		//
+		// This is the difference between a move the server accepts and one it
+		// silently drops. A replayed capture carries the timestamp from
+		// whenever it was recorded - potentially minutes old - and a stale
+		// timestamp reads as out-of-order traffic. The hook gives us the
+		// client's own clock at a known tick, so age it forward to now.
+		//
+		// Only the hook's clock is used. Guessing the epoch (GetTickCount, a
+		// login timer, ...) would be a guess; this value is observed.
+		if (g_walkStampClock && g_walkClockField > 0 && haveLive)
+		{
+			const uint32_t aged = live.clock
+				+ (uint32_t)(GetTickCount() - live.capturedTick)
+				+ (uint32_t)g_jumpSpeedMs;
+
+			n = SetFieldValue(g_buildBody, g_buildBodyBytes,
+				g_walkClockField, (uint64_t)aged);
 			if (n < 0) return false;
 			g_buildBodyBytes = n;
 		}
@@ -1301,6 +1357,11 @@ namespace {
 	// -----------------------------------------------------------------------
 	// Tab: Map  (the template's default look)
 	// -----------------------------------------------------------------------
+	// Defined with the packet builder further down. Declared here because the
+	// Map tab's "Jump X+5" button runs a move, and this tab is drawn well
+	// before the builder in the file.
+	void DoMoveToTarget();
+
 	void DrawMapTab()
 	{
 		if (BeginSection("Overview"))
@@ -1329,7 +1390,42 @@ namespace {
 			Caption("Idle");
 			ImGui::Spacing();
 			ImGui::Text("Current Map: Twin City (1882)");
-			ImGui::Text("Hero Pos: (432, 376)");
+
+			// The Hero Pos line used to be a hardcoded placeholder. Show the
+			// real position when the ACTION hook has seen a move, and say so
+			// honestly when it has not rather than printing a made-up pair.
+			{
+				PacketCapture::LastAction live;
+				if (PacketCapture::GetLastAction(live))
+					ImGui::Text("Hero Pos: (%d, %d)  dir %d", live.targetX, live.targetY, live.dir);
+				else
+					ImGui::TextDisabled("Hero Pos: unknown - move once");
+			}
+
+			// Quick step: move 5 tiles east of wherever the character is.
+			//
+			// The starting point comes from the ACTION hook, so this is
+			// relative to the character's real position rather than to a
+			// stale capture - pressing it repeatedly walks east 5 at a time.
+			if (ImGui::Button("Jump X+5"))
+			{
+				PacketCapture::LastAction live;
+				if (PacketCapture::GetLastAction(live))
+				{
+					g_walkX = live.targetX + 5;
+					g_walkY = live.targetY;
+				}
+				else
+				{
+					// No live fix yet - step from whatever is in the box so
+					// the button still does something predictable.
+					g_walkX += 5;
+				}
+				DoMoveToTarget();
+			}
+			ImGui::SameLine();
+			ImGui::TextDisabled("-> (%d, %d)", g_walkX, g_walkY);
+
 			ImGui::Spacing();
 			ImGui::Checkbox("Speedhack If No Players Nearby", &g_speedhack);
 			Caption("Replays the jump packet the client itself sends, so the server "
@@ -1981,6 +2077,7 @@ namespace {
 	void DrawBuilderRaw();
 	void DrawBuilderFlash();
 	void DrawJumpToCell();
+	void DoMoveToTarget();
 	void CopyBuilderPacket();
 	void BuildHexLine(const uint8_t* data, int bytes, char* out, size_t outSize);
 	int  ParseHexString(const char* text, uint8_t* out, int maxBytes);
@@ -2239,6 +2336,53 @@ namespace {
 		DrawBuilderFlash();
 	}
 
+	// Watches for the server's answer to a move and logs the verdict.
+	//
+	// A send returning 0 means the CLIENT accepted the bytes. It says nothing
+	// about the server. The server answers by echoing the position back as a
+	// 0x0833 receive, so that echo is the only end-to-end proof. Called once
+	// per frame; cheap when nothing is pending.
+	void TickMoveVerify()
+	{
+		if (!g_movePending) return;
+
+		PacketCapture::ServerPos sp;
+		if (PacketCapture::GetServerPos(sp) && sp.tick >= g_moveSentTick)
+		{
+			const bool reached = (sp.x == g_moveToX && sp.y == g_moveToY);
+
+			HookLog("[Move] SERVER SAYS (%d,%d); asked (%d,%d) from (%d,%d) -> %s",
+				sp.x, sp.y, g_moveToX, g_moveToY, g_moveFromX, g_moveFromY,
+				reached ? "ACCEPTED" : "different position");
+
+			g_buildFlashUntil = (float)ImGui::GetTime() + 5.0f;
+			g_buildFlashError = !reached;
+			if (reached)
+				_snprintf_s(g_buildFlashText, _TRUNCATE,
+					"Move worked - server put us at (%d, %d)", sp.x, sp.y);
+			else
+				_snprintf_s(g_buildFlashText, _TRUNCATE,
+					"Server reports (%d, %d), not (%d, %d)",
+					sp.x, sp.y, g_moveToX, g_moveToY);
+
+			g_movePending = false;
+			return;
+		}
+
+		if ((uint32_t)(GetTickCount() - g_moveSentTick) > kMoveVerifyMs)
+		{
+			HookLog("[Move] NO SERVER ECHO within %ums - the move was rejected. "
+				"Asked for (%d,%d) from (%d,%d).",
+				kMoveVerifyMs, g_moveToX, g_moveToY, g_moveFromX, g_moveFromY);
+
+			g_buildFlashUntil = (float)ImGui::GetTime() + 6.0f;
+			g_buildFlashError = true;
+			_snprintf_s(g_buildFlashText, _TRUNCATE,
+				"No server echo within %ums - move rejected", kMoveVerifyMs);
+			g_movePending = false;
+		}
+	}
+
 	// Runs one move to (g_walkX, g_walkY) and reports the outcome.
 	//
 	// Shared by the Move button and the coordinate text box so both paths
@@ -2246,6 +2390,24 @@ namespace {
 	// BuildJumpGoal, which is what stamps the origin as well as the target.
 	void DoMoveToTarget()
 	{
+		// Remember where we started. Without this the verifier could only say
+		// "some position changed", not "we reached the target we asked for".
+		PacketCapture::LastAction live;
+		if (PacketCapture::GetLastAction(live))
+		{
+			g_moveFromX = live.targetX;
+			g_moveFromY = live.targetY;
+		}
+		else
+		{
+			// No live fix - fall back to the box, which is at least what the
+			// operator is looking at.
+			g_moveFromX = g_walkX;
+			g_moveFromY = g_walkY;
+		}
+		g_moveToX = g_walkX;
+		g_moveToY = g_walkY;
+
 		if (BuildJumpGoal(g_walkX, g_walkY))
 		{
 			const int result = PacketSend::SendSlot(g_walkGoalMsgId,
@@ -2254,14 +2416,27 @@ namespace {
 			g_buildFlashUntil = (float)ImGui::GetTime() + 3.0f;
 			g_buildFlashError = (result != 0);
 			if (result == 0)
+			{
 				_snprintf_s(g_buildFlashText, _TRUNCATE,
-					"Moved to (%d, %d) - 0x%04X %d bytes",
-					g_walkX, g_walkY, (unsigned)g_walkGoalMsgId, g_walkGoalBytes);
+					"Sent (%d,%d) -> (%d,%d), checking the server...",
+					g_moveFromX, g_moveFromY, g_moveToX, g_moveToY);
+
+				// Arm the verifier. "Sent" is not "worked" - the send path
+				// only proves the client accepted the bytes.
+				g_movePending = true;
+				g_moveSentTick = GetTickCount();
+
+				HookLog("[Move] SENT  (%d,%d) -> (%d,%d)  %d bytes  id=0x%04X",
+					g_moveFromX, g_moveFromY, g_moveToX, g_moveToY,
+					g_walkGoalBytes, (unsigned)g_walkGoalMsgId);
+			}
 			else
+			{
 				_snprintf_s(g_buildFlashText, _TRUNCATE,
 					"Move send failed (%d) - see the log", result);
-			HookLog("[Send] move to (%d,%d) -> %s", g_walkX, g_walkY,
-				result == 0 ? "ok" : "failed");
+				HookLog("[Move] SEND FAILED (result %d)  target (%d,%d)",
+					result, g_moveToX, g_moveToY);
+			}
 		}
 		else
 		{
@@ -2398,18 +2573,46 @@ namespace {
 		ImGui::SameLine();
 		ImGui::Checkbox("stamp origin##jumpcell", &g_walkStampOrigin);
 
+		ImGui::SameLine();
+		ImGui::Checkbox("stamp clock##jumpcell", &g_walkStampClock);
+		if (g_walkStampClock)
+		{
+			ImGui::SameLine();
+			ImGui::SetNextItemWidth(55.0f);
+			ImGui::InputInt("t##jumpcell", &g_walkClockField, 1, 5);
+			if (g_walkClockField < 0) g_walkClockField = 0;
+		}
+
 		// Read the capture's own target so the operator can see the "from"
 		// the packet will carry - if it is not where they actually are, the
 		// jump will be rejected, and pressing Load Cell refreshes it.
-		int curX = 0, curY = 0;
-		const bool haveCur = ReadMoveTarget(walkSlot.body, walkSlot.bodyBytes,
-			g_walkPosFieldX, g_walkPosFieldY, curX, curY);
+		// Show where the packet will claim the character is starting from, and
+		// whether that is live data or a stale capture. A move whose origin
+		// is not where the character actually is can be rejected, so this
+		// line is the first thing to look at when a move does nothing.
+		PacketCapture::LastAction live;
+		const bool haveLive = PacketCapture::GetLastAction(live);
 
-		if (haveCur)
-			ImGui::TextDisabled("from capture: (%d, %d)  ->  target: (%d, %d)",
-				curX, curY, g_walkX, g_walkY);
+		if (haveLive)
+			ImGui::TextColored(ImVec4(0.45f, 0.75f, 0.95f, 1.0f),
+				"live: from (%d, %d) dir %d  ->  target (%d, %d)",
+				live.targetX, live.targetY, live.dir, g_walkX, g_walkY);
 		else
-			ImGui::TextDisabled("target: (%d, %d)", g_walkX, g_walkY);
+		{
+			int curX = 0, curY = 0;
+			const bool haveCur = ReadMoveTarget(walkSlot.body, walkSlot.bodyBytes,
+				g_walkPosFieldX, g_walkPosFieldY, curX, curY);
+
+			if (haveCur)
+				ImGui::TextDisabled("capture only: from (%d, %d)  ->  target (%d, %d)",
+					curX, curY, g_walkX, g_walkY);
+			else
+				ImGui::TextDisabled("target (%d, %d)", g_walkX, g_walkY);
+		}
+
+		if (!haveLive)
+			Caption("No live move seen yet - walk once so the clock and "
+				"origin come from the client instead of the capture.");
 
 		if (g_walkHasGoal)
 		{
@@ -2925,6 +3128,7 @@ namespace {
 		// started before the window was hidden still completes.
 		TickBuilderPacer();
 		TickJumpAutoFire();
+		TickMoveVerify();
 
 		ImGui::End();
 

@@ -122,6 +122,57 @@ namespace PacketCapture {
 	typedef int(__thiscall* DoSendMsgFn)(void* self, void* msg);
 	DoSendMsgFn RealDoSendMsg();
 
+	// ---- the client's own last CMsgAction, as observed by the ACTION hook --
+	//
+	// This is what makes an injected move look like one the client sent
+	// itself. A replayed capture carries a STALE timestamp and a STALE
+	// origin - the clock and position from whenever the capture was taken -
+	// and a server that checks either will drop the move. The hook sees a
+	// real action, so it holds the character's current position and the
+	// client's live clock.
+	//
+	//   targetX/targetY  where the character last moved TO = where it is now
+	//   clock            the client's own clock (ms) at that moment
+	//   capturedTick     GetTickCount() when we observed it, so the caller
+	//                    can age the clock forward to the present
+	struct LastAction
+	{
+		bool     valid;
+		uint32_t id;
+		int      originX, originY;   // where that move started
+		int      targetX, targetY;   // where it ended == current position
+		int      dir;
+		int      mode;
+		uint32_t clock;              // client clock at capture time
+		uint32_t capturedTick;       // GetTickCount() at capture time
+	};
+
+	// Copies the last observed action. Returns false if the hook has not
+	// seen one yet, so callers can fall back to the captured template
+	// rather than sending zeros.
+	bool GetLastAction(LastAction& out);
+
+	// ---- the last position the SERVER reported for us --------------------
+	//
+	// A move we send is only known to have worked when the server echoes it
+	// back. It does that as a 0x0833 RECV carrying the same field layout, so
+	// the receive hook parses one and records it here.
+	//
+	// This is the end-to-end answer to "did the move work": if the server
+	// reports us at the coordinate we asked for, it accepted the move. If it
+	// keeps reporting the old position, it rejected it.
+	struct ServerPos
+	{
+		bool     valid;
+		uint32_t id;
+		int      x, y;
+		int      mode;
+		uint32_t tick;      // GetTickCount() when it arrived
+		uint32_t seq;       // capture sequence, so a caller can tell repeats apart
+	};
+
+	bool GetServerPos(ServerPos& out);
+
 	// The CMyClientSocket* seen on the most recent outgoing send. Needed
 	// because DoSendMsg is __thiscall - the socket is the implicit `this`.
 	// Null until at least one packet has been sent this session.
