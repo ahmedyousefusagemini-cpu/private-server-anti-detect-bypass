@@ -937,6 +937,33 @@ namespace {
 		return true;
 	}
 
+	// The direction a step faces, as f13.
+	//
+	// Derived from every real move in the packet log - 18 of 18 matched - so
+	// this is the client's own rule, not a guess. It is the DOMINANT AXIS of
+	// (target - origin), not the octant: a step of (+3,+10) is South, not
+	// South-East.
+	//
+	//     0 = S (+y)    2 = W (-x)    4 = N (-y)    6 = E (+x)
+	//
+	// The client never sent 1/3/5/7 for a move, which is consistent with
+	// walking being axis-aligned.
+	//
+	// This matters because the packet carries the facing as a field. Copying
+	// the previous move's direction - which is what the synthesis did at
+	// first - means a step in a new direction declares the wrong facing, and
+	// the server can refuse the move.
+	int DirectionFromDelta(int dx, int dy)
+	{
+		if (dx == 0 && dy == 0) return 0;
+
+		const int adx = (dx < 0) ? -dx : dx;
+		const int ady = (dy < 0) ? -dy : dy;
+
+		if (ady >= adx) return (dy > 0) ? 0 : 4;   // south / north
+		return (dx > 0) ? 6 : 2;                   // east / west
+	}
+
 	// Writes a complete 0x0833 move body from scratch.
 	//
 	// This replaces editing a captured template, which was the wrong design.
@@ -991,8 +1018,12 @@ namespace {
 		out[n++] = 0x60;                 // f12 mode
 		n = WriteVarint(out, n, maxBytes, 137);
 
+		// f13 is COMPUTED from this step, not copied from the previous move.
+		// A step in a new direction must declare the facing that goes with
+		// it; carrying the last move's facing is what got a move rejected.
 		out[n++] = 0x68;                 // f13 direction
-		n = WriteVarint(out, n, maxBytes, (uint64_t)(live.dir & 0xFF));
+		n = WriteVarint(out, n, maxBytes,
+			(uint64_t)DirectionFromDelta(x - originX, y - originY));
 
 		out[n++] = 0x70;                 // f14 origin X
 		n = WriteVarint(out, n, maxBytes, (uint64_t)originX);
@@ -2450,8 +2481,12 @@ namespace {
 				g_movePending = true;
 				g_moveSentTick = GetTickCount();
 
-				HookLog("[Move] SENT  (%d,%d) -> (%d,%d)  %d bytes  id=0x%04X",
+				// Report the direction too: it is computed per step now, and
+				// a wrong facing is a plausible cause of a rejection, so it
+				// needs to be visible rather than buried in the hex.
+				HookLog("[Move] SENT  (%d,%d) -> (%d,%d)  dir %d  %d bytes  id=0x%04X",
 					g_moveFromX, g_moveFromY, g_moveToX, g_moveToY,
+					DirectionFromDelta(g_moveToX - g_moveFromX, g_moveToY - g_moveFromY),
 					g_walkGoalBytes, (unsigned)g_walkGoalMsgId);
 			}
 			else
