@@ -97,6 +97,31 @@ namespace {
 	// accepted: the server echoes accepted moves back with the same layout.
 	ServerPos g_serverPos = {};
 
+	// The socket the most recent outgoing send travelled on. DoSendMsg is
+	// __thiscall, so `self` is the CMyClientSocket*; PacketSend needs it to
+	// re-issue a message. Games routinely recreate the socket on reconnect,
+	// so it is refreshed on every send rather than cached once.
+	void* volatile g_lastSendSocket = nullptr;
+
+	CRITICAL_SECTION g_lock;
+	bool g_lockReady = false;
+	bool g_installed = false;
+
+	// Separate lock for packets.log: file I/O must never block the renderer,
+	// which takes g_lock once per frame to read the ring.
+	CRITICAL_SECTION g_fileLock;
+	bool g_fileLockReady = false;
+
+	Entry g_ring[kRingSize];
+	long g_head = 0;
+	long g_count = 0;
+	uint32_t g_total = 0;
+
+	volatile long g_paused = 0;
+	volatile long g_totalSend = 0;
+	volatile long g_totalRecv = 0;
+	volatile long g_totalDropped = 0;
+
 	// Minimal varint walker, receive side. The overlay has a fuller one, but
 	// it lives in a different translation unit and this only needs the four
 	// fields that matter (id, target x/y, mode).
@@ -141,9 +166,14 @@ namespace {
 	// Pulls id / target x / target y / mode out of a 0x0833 receive and stores
 	// it. The wire layout is [u16 len][u16 id][protobuf], so the walk starts
 	// at byte 4.
+	//
+	// Defined after the globals above, and gated on g_lockReady the same way
+	// the ring writers are: this can be reached from the receive thread
+	// before Install() has initialised the lock.
 	void RecordServerPos(const uint8_t* packet, int length)
 	{
 		if (!packet || length < 8) return;
+		if (!g_lockReady) return;
 
 		uint32_t id = 0;
 		int x = 0, y = 0, mode = 0;
@@ -181,31 +211,6 @@ namespace {
 		g_serverPos.seq = g_total;
 		LeaveCriticalSection(&g_lock);
 	}
-
-	// The socket the most recent outgoing send travelled on. DoSendMsg is
-	// __thiscall, so `self` is the CMyClientSocket*; PacketSend needs it to
-	// re-issue a message. Games routinely recreate the socket on reconnect,
-	// so it is refreshed on every send rather than cached once.
-	void* volatile g_lastSendSocket = nullptr;
-
-	CRITICAL_SECTION g_lock;
-	bool g_lockReady = false;
-	bool g_installed = false;
-
-	// Separate lock for packets.log: file I/O must never block the renderer,
-	// which takes g_lock once per frame to read the ring.
-	CRITICAL_SECTION g_fileLock;
-	bool g_fileLockReady = false;
-
-	Entry g_ring[kRingSize];
-	long g_head = 0;
-	long g_count = 0;
-	uint32_t g_total = 0;
-
-	volatile long g_paused = 0;
-	volatile long g_totalSend = 0;
-	volatile long g_totalRecv = 0;
-	volatile long g_totalDropped = 0;
 
 	// ---- configuration ----------------------------------------------------
 	bool g_fileLog = true;
@@ -536,7 +541,7 @@ namespace {
 		// The clock is recorded alongside GetTickCount() so the reader can
 		// age it forward - a captured clock is already stale by the time
 		// anyone uses it.
-		if (a6 == 137)
+		if (a6 == 137 && g_lockReady)
 		{
 			EnterCriticalSection(&g_lock);
 			g_lastAction.valid = true;
@@ -578,7 +583,13 @@ namespace {
 // origin, and a server that checks either will drop the move.
 bool GetLastAction(LastAction& out)
 {
-	EnsureLock();
+	// Same guard the ring readers use: the overlay can ask for this before
+	// Install() has initialised the lock. Returning false with a zeroed
+	// struct keeps the caller on its "no live data yet" path rather than
+	// reading an uninitialised critical section.
+	out = LastAction();
+	if (!g_lockReady) return false;
+
 	EnterCriticalSection(&g_lock);
 	out = g_lastAction;
 	LeaveCriticalSection(&g_lock);
@@ -589,7 +600,9 @@ bool GetLastAction(LastAction& out)
 // packet_capture.h: this is the end-to-end check on whether a move worked.
 bool GetServerPos(ServerPos& out)
 {
-	EnsureLock();
+	out = ServerPos();
+	if (!g_lockReady) return false;
+
 	EnterCriticalSection(&g_lock);
 	out = g_serverPos;
 	LeaveCriticalSection(&g_lock);
