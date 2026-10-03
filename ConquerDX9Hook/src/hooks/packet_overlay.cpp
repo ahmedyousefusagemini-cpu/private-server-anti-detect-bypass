@@ -1554,7 +1554,7 @@ namespace {
 	// Tab: Map  (the template's default look)
 	// -----------------------------------------------------------------------
 	// Defined with the packet builder further down. Declared here because the
-	// Map tab's "Jump X+5" button runs a move, and this tab is drawn well
+	// Map tab's "Jump X+20" button runs a move, and this tab is drawn well
 	// before the builder in the file.
 	void DoMoveToTarget();
 
