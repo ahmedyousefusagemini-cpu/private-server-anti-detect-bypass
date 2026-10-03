@@ -247,6 +247,11 @@ namespace {
 	int    g_walkY = 0;
 	char   g_walkTargetText[64] = "";              // typed "x,y" for the quick box
 
+	// When on, the X/Y boxes track the character's live position, so the
+	// operator never has to load coordinates from a capture. Typing in either
+	// box turns it off, so a hand-entered target is not overwritten.
+	bool   g_walkFollow = true;
+
 	// Move verification.
 	//
 	// A send that returns 0 only means the client accepted the bytes - it
@@ -2578,17 +2583,23 @@ namespace {
 		// Seed the boxes from the loaded capture the first time, so the
 		// operator starts from a real position rather than 0,0. A static is
 		// fine here: this panel is only drawn on the single render thread.
-		static bool seeded = false;
-		if (!seeded)
+		// The boxes track the character's LIVE position.
+		//
+		// This used to seed them once from the loaded capture, which meant
+		// they showed wherever the character stood when that packet was
+		// recorded - stale the moment it took a step, and completely wrong
+		// after a walk. The ACTION hook sees every move the client makes, so
+		// its last target IS the current position.
+		//
+		// Typing in either box turns the follow off, so a hand-entered
+		// target is never silently overwritten.
+		PacketCapture::LastAction live;
+		const bool haveLive = PacketCapture::GetLastAction(live);
+
+		if (haveLive && g_walkFollow)
 		{
-			int x = 0, y = 0;
-			if (ReadMoveTarget(walkSlot.body, walkSlot.bodyBytes,
-				g_walkPosFieldX, g_walkPosFieldY, x, y))
-			{
-				g_walkX = x;
-				g_walkY = y;
-			}
-			seeded = true;
+			g_walkX = live.targetX;
+			g_walkY = live.targetY;
 		}
 
 		// --- quick path: type the coordinates ------------------------------
@@ -2615,6 +2626,7 @@ namespace {
 			{
 				g_walkX = tx;
 				g_walkY = ty;
+				g_walkFollow = false;   // a typed target is not overwritten
 				DoMoveToTarget();
 			}
 			else
@@ -2638,15 +2650,20 @@ namespace {
 		// the way the old packed-cell version was.
 		ImGui::SameLine();
 		ImGui::SetNextItemWidth(70.0f);
-		ImGui::InputInt("X##jumpcell", &g_walkX, 1, 10);
+		if (ImGui::InputInt("X##jumpcell", &g_walkX, 1, 10)) g_walkFollow = false;
 		if (g_walkX < 0) g_walkX = 0;
 		if (g_walkX > 4095) g_walkX = 4095;
 
 		ImGui::SameLine();
 		ImGui::SetNextItemWidth(70.0f);
-		ImGui::InputInt("Y##jumpcell", &g_walkY, 1, 10);
+		if (ImGui::InputInt("Y##jumpcell", &g_walkY, 1, 10)) g_walkFollow = false;
 		if (g_walkY < 0) g_walkY = 0;
 		if (g_walkY > 4095) g_walkY = 4095;
+
+		// Follow toggle. On by default so the boxes are always the character's
+		// real position; off to keep a target you typed.
+		ImGui::SameLine();
+		ImGui::Checkbox("follow##jumpcell", &g_walkFollow);
 
 		ImGui::SameLine();
 		ImGui::SetNextItemWidth(55.0f);
@@ -2682,16 +2699,9 @@ namespace {
 			if (g_walkClockField < 0) g_walkClockField = 0;
 		}
 
-		// Read the capture's own target so the operator can see the "from"
-		// the packet will carry - if it is not where they actually are, the
-		// jump will be rejected, and pressing Load Cell refreshes it.
-		// Show where the packet will claim the character is starting from, and
-		// whether that is live data or a stale capture. A move whose origin
-		// is not where the character actually is can be rejected, so this
-		// line is the first thing to look at when a move does nothing.
-		PacketCapture::LastAction live;
-		const bool haveLive = PacketCapture::GetLastAction(live);
-
+		// Show where the packet will claim the character is starting from.
+		// `live`/`haveLive` come from the follow block above - this used to
+		// re-declare them, which does not compile in the same scope.
 		if (haveLive)
 			ImGui::TextColored(ImVec4(0.45f, 0.75f, 0.95f, 1.0f),
 				"live: from (%d, %d) dir %d  ->  target (%d, %d)",
