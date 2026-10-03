@@ -124,7 +124,16 @@ void ObserveSend(void* socket, const void* msg)
 		// The body we store starts at the id, so its size is length minus
 		// the 4-byte [vtable][len] prefix (the id itself is part of the
 		// length DoSendMsg validates).
-		const uint16_t bodyBytes = (uint16_t)(length - 4);
+		// `length` at msg+4 is the size of the whole wire packet, which is
+		// [u16 len][u16 id][payload]. The body we store starts at the id, so
+		// it is the packet minus the 2-byte len field: length - 2.
+		//
+		// This used to be length - 4, which dropped the last 2 payload bytes
+		// of EVERY captured template. Combined with SendSlot's matching
+		// error the total size came out right, which is why it looked
+		// healthy - but the final 2 bytes were zeros, corrupting the last
+		// field of every packet we replayed.
+		const uint16_t bodyBytes = (uint16_t)(length - 2);
 		if (bodyBytes > kMaxBodyBytes) return;
 		if (bodyBytes < 2) return;            // at least the id must fit
 
@@ -282,9 +291,19 @@ int SendSlot(uint16_t messageId, const uint8_t* bodyOverride, int bodyOverrideBy
 	if (bodyBytes < 2) bodyBytes = 2;
 
 	// DoSendMsg validates *(u16*)(msg+4) against the virtual GetSize() and
-	// memcpy's that many bytes from msg+4. The body we hold starts at the
-	// id, so the wire length is bodyBytes + the 4-byte [vtable][len] prefix.
-	const uint16_t length = (uint16_t)(bodyBytes + 4);
+	// memcpy's that many bytes from msg+4. So `length` IS the size of the
+	// wire packet, which is laid out as [u16 len][u16 id][payload].
+	//
+	// The body we hold starts at the id, so the bytes actually written from
+	// msg+4 are 2 (the len field) + bodyBytes (id + payload). That is the
+	// number `length` has to be.
+	//
+	// It used to be bodyBytes + 4, which told DoSendMsg to read 2 bytes past
+	// the body - the zeros from the memset below. Every injected packet
+	// therefore ended in two zero bytes, which corrupts the last field. For
+	// the 0x0833 move that is the tail of f20's 10-byte all-ones varint, so
+	// the message reached the server malformed and was dropped.
+	const uint16_t length = (uint16_t)(bodyBytes + 2);
 
 	// Lay the message out in the scratch buffer. This is the whole trick:
 	// we reuse the vtable we observed on a live CMsg, so the virtual
@@ -309,7 +328,11 @@ int SendSlot(uint16_t messageId, const uint8_t* bodyOverride, int bodyOverrideBy
 
 	// Record what is actually going out, before it goes out - if the send
 	// faults we still want to see the bytes we tried.
-	LogInjected(out, length);
+	// out+4, not out: the buffer starts with the 4-byte [vtable][len] prefix,
+	// and the wire packet begins at the len field. Logging from `out` shifted
+	// every byte by 4, so the id read back as garbage (0x016F instead of
+	// 0x0833) and the dump was 4 bytes short.
+	LogInjected(out + 4, length);
 
 	int result = 0;
 	__try

@@ -57,7 +57,11 @@ namespace PacketSend
 
 	// Body bytes kept per slot. The body starts at the message id, so it is
 	// the wire length minus the 4-byte [vtable][length] prefix.
-	const int kMaxBodyBytes = kMaxMessageBytes - 4;
+	// The body is [u16 id][payload] and sits inside a wire packet of
+	// [u16 len][u16 id][payload], so the body is the message minus the 2-byte
+	// length field - not minus the 4-byte [vtable][len] prefix that precedes
+	// it in the CMsg object.
+	const int kMaxBodyBytes = kMaxMessageBytes - 2;
 
 	// Number of distinct packet ids that can be armed for replay at once.
 	const int kMaxSlots = 16;
