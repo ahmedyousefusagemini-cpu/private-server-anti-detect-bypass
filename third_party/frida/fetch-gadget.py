@@ -46,7 +46,12 @@ from pathlib import Path
 DEFAULT_TAG = "17.22.1"
 DEFAULT_ARCH = "x86"
 DEFAULT_NAME = "D3DX9_43_44.dll"
-DEFAULT_OUT = "deploy"
+
+# Resolved against the repo root rather than the cwd: running this script from
+# inside third_party/frida/ would otherwise make "--out deploy" mean a nested
+# deploy/ there, scattering an 18 MB duplicate of the Gadget.
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+DEFAULT_OUT = str(REPO_ROOT / "deploy")
 
 ASSET_TEMPLATE = "frida-gadget-{tag}-windows-{arch}.dll.xz"
 URL_TEMPLATE = "https://github.com/frida/frida/releases/download/{tag}/{asset}"
@@ -227,7 +232,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--tag", default=DEFAULT_TAG, help=f"Frida release (default {DEFAULT_TAG})")
     parser.add_argument("--arch", default=DEFAULT_ARCH, help=f"target arch (default {DEFAULT_ARCH})")
     parser.add_argument("--name", default=DEFAULT_NAME, help="deployed Gadget filename")
-    parser.add_argument("--out", default=DEFAULT_OUT, help="output directory (default deploy)")
+    parser.add_argument("--out", default=DEFAULT_OUT, help="output directory (default <repo>/deploy)")
     parser.add_argument("--force", action="store_true", help="re-download even if present")
     parser.add_argument("--no-config", action="store_true", help="do not write the sidecar .config")
     parser.add_argument(
