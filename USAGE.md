@@ -110,6 +110,44 @@ frida-ps -H 127.0.0.1:27042                 # list what the endpoint exposes
 frida -H 127.0.0.1:27042 -l scripts/agent.js <name>
 ```
 
+### Proving it works
+
+`scripts/smoke_test.py` walks the layers and stops at the first that breaks, so
+the failure names itself instead of surfacing as one opaque error:
+
+```
+python scripts/smoke_test.py
+```
+
+```
+[1] Listener reachable
+  [ok]  TCP connect succeeded
+
+[2] Remote device answers
+  [ok]  processes: Gadget(15412)
+
+[3] Attach and load the agent
+  [ok]  attached to Gadget (pid 15412), loaded agent.js
+
+[4] Agent answers
+  [ok]  ping: arch=ia32 pointerSize=4 runtime=QJS frida=17.22.1
+
+[5] Primitives work in-process
+  [ok]  target is 32-bit: arch=ia32 pointerSize=4
+  [ok]  writeValue / readValue round trip: wrote 1234567, read 1234567
+  [ok]  exact scan finds the sentinel: candidates=1 found=true
+  [ok]  snapshot + changed refine narrows to one slot: candidates=1
+  [ok]  Interceptor hook fires: calls=3
+```
+
+Stage 5 is the real proof, and it is safe against a live game: it allocates its
+own scratch memory, writes a sentinel, scans for it, narrows by `changed`, then
+hooks `kernel32!GetTickCount` and **calls it itself** — so the result never
+depends on what the game happens to be doing. It reads and writes no game state.
+
+Use `--stop-at 4` to check only the connection and script loading. From the
+`attach.py` REPL, `rpc.selfTest()` runs the same in-process checks.
+
 ### If it does not connect
 
 `frida.ServerNotRunningError: unable to connect to remote frida-server` only
@@ -231,6 +269,7 @@ All of these are callable as `rpc.<name>(...)`.
 | `readValue(address, type, length?)` | typed read |
 | `writeValue(address, type, value)` | typed write |
 | `resolveExport(module, symbol)` | export -> address |
+| `exports(module, filter?)` | list a module's exports — find something to hook |
 | `scanStart(type, options)` | exact search, or snapshot when `options.value` is omitted |
 | `scanRefine(scanId, mode, options)` | narrow a snapshot |
 | `scanResults(scanId, offset?, limit?)` | page candidates with live values |
@@ -239,6 +278,7 @@ All of these are callable as `rpc.<name>(...)`.
 | `hookExport(module, symbol, signature, options?)` | Interceptor hook, records calls |
 | `traceEvents(traceId, offset?, limit?)` | page recorded calls |
 | `traceStop(traceId)` | detach and return all events |
+| `selfTest()` | run the stage-5 checks in-process and return pass/fail |
 
 `scripts/agent.js` is the source of truth — read it to see exactly what each
 call returns.
@@ -256,6 +296,24 @@ startup, so replacing the file on disk does nothing until you restart the game.*
 
 **`attach.py` connects but every call fails.** Version skew between the client
 and the Gadget. Pin `frida==17.22.1`.
+
+**Your own JS fails with `Module.findExportByName is not a function`.** Frida 17
+removed the static `Module.findExportByName`, `Module.getExportByName` and
+`Module.enumerateExports`. Per-module lookup now lives on the `Module` instances
+returned by `Process.enumerateModules()` / `Process.getModuleByName()`:
+
+```js
+const k32 = Process.getModuleByName('kernel32.dll');
+k32.getExportByName('GetTickCount');     // -> NativePointer
+k32.enumerateExports();                  // -> [{type, name, address}, ...]
+
+Module.getGlobalExportByName('GetTickCount');   // still static
+```
+
+Only `Module.load`, `Module.getGlobalExportByName` and
+`Module.findGlobalExportByName` remain static, and the global ones **throw**
+rather than return null when the symbol is absent. `scripts/agent.js` tries both
+shapes, so `rpc.resolveExport` and `rpc.exports` work on old and new Frida alike.
 
 **No listener after launching the game.** The Gadget was not found or failed to
 load. Check with DebugView: the loader logs to `OutputDebugStringA/W` as

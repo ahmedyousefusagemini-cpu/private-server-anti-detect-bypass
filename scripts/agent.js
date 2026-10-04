@@ -103,31 +103,46 @@ function aligned(address, alignment) {
   return address.toUInt32() % alignment === 0;
 }
 
-function resolveExport(moduleName, symbol) {
-  const attempts = [
-    () => Module.findExportByName(moduleName, symbol),
-    () => Module.getExportByName(moduleName, symbol),
-  ];
-  for (const attempt of attempts) {
-    try {
-      const address = attempt();
-      if (address !== null && address !== undefined) {
-        return address;
-      }
-    } catch (error) {
-      // Fall through to the next spelling.
-    }
+function tryCall(fn) {
+  try {
+    const value = fn();
+    return value === null || value === undefined ? null : value;
+  } catch (error) {
+    return null;
   }
-  if (!moduleName) {
-    try {
-      const address = Module.getGlobalExportByName(symbol);
+}
+
+// Resolve a symbol to an address.
+//
+// Frida 17 removed the static Module.findExportByName / getExportByName /
+// enumerateExports. Per-module lookup moved onto the Module instances that
+// Process.getModuleByName and Process.enumerateModules return; only
+// Module.getGlobalExportByName and Module.findGlobalExportByName are still
+// static, and they throw rather than return null when the symbol is absent.
+// The legacy statics are tried last so this keeps working on older Frida.
+function resolveExport(moduleName, symbol) {
+  if (moduleName) {
+    const module = tryCall(() => Process.getModuleByName(moduleName));
+    if (module) {
+      const address =
+        tryCall(() => module.getExportByName(symbol)) ||
+        tryCall(() => module.findExportByName(symbol));
       if (address) {
         return address;
       }
-    } catch (error) {
-      // Not available on this Frida version.
     }
   }
+
+  const global =
+    tryCall(() => Module.getGlobalExportByName(symbol)) ||
+    tryCall(() => Module.findGlobalExportByName(symbol)) ||
+    tryCall(() => Module.getExportByName(moduleName || null, symbol)) ||
+    tryCall(() => Module.findExportByName(moduleName || null, symbol));
+
+  if (global) {
+    return global;
+  }
+
   throw new Error('export not found: ' + (moduleName ? moduleName + '!' : '') + symbol);
 }
 
@@ -215,6 +230,22 @@ rpc.exports.writeValue = function (address, type, value) {
 
 rpc.exports.resolveExport = function (moduleName, symbol) {
   return resolveExport(moduleName || null, symbol).toString();
+};
+
+// List a module's exports, optionally filtered by substring. This is how you
+// find something worth hooking. Uses the Frida 17 instance API; the static
+// Module.enumerateExports no longer exists.
+rpc.exports.exports = function (moduleName, filter) {
+  const module = Process.getModuleByName(moduleName);
+  const needle = filter ? filter.toLowerCase() : null;
+  return module
+    .enumerateExports()
+    .filter((entry) => !needle || entry.name.toLowerCase().indexOf(needle) !== -1)
+    .map((entry) => ({
+      type: entry.type,
+      name: entry.name,
+      address: entry.address.toString(),
+    }));
 };
 
 /* ------------------------------------------------------------------ scans */
@@ -559,7 +590,9 @@ function parseSignature(signature) {
   const argTypes = match[2]
     .split(',')
     .map((part) => part.trim())
-    .filter((part) => part.length > 0)
+    // 'void' in the parameter list means "takes no arguments", not "one void
+    // argument" - without this, int(void) would read a bogus args[0].
+    .filter((part) => part.length > 0 && part !== 'void')
     .map((part) => {
       const mapped = NATIVE_TYPES[part];
       if (!mapped) {
@@ -696,6 +729,85 @@ rpc.exports.traceStop = function (traceId) {
   const events = trace.events.slice();
   traces.delete(traceId);
   return { traceId, calls: events.length, truncated: trace.truncated, events };
+};
+
+/* --------------------------------------------------------------- self test */
+
+// End-to-end check of the primitives, driven from the host with
+// rpc.selfTest(). Everything it touches is memory it allocates itself, so it
+// is safe to run against a live game: it never reads or writes game state.
+rpc.exports.selfTest = function () {
+  const checks = [];
+  const check = (name, ok, detail) => checks.push({ name, ok: !!ok, detail: String(detail) });
+
+  check(
+    'target is 32-bit',
+    Process.arch === 'ia32' && Process.pointerSize === 4,
+    'arch=' + Process.arch + ' pointerSize=' + Process.pointerSize
+  );
+
+  // Typed read/write round trip through the public rpc surface.
+  const scratch = Memory.alloc(64);
+  const address = scratch.toString();
+  const region = [{ base: address, size: 64 }];
+
+  rpc.exports.writeValue(address, 'int32', 1234567);
+  const readBack = rpc.exports.readValue(address, 'int32');
+  check(
+    'writeValue / readValue round trip',
+    readBack.value === 1234567,
+    'wrote 1234567, read ' + readBack.value
+  );
+
+  // Exact scan must find a sentinel we placed ourselves, so the expected
+  // answer is known rather than inferred from whatever the game happens to hold.
+  const SENTINEL = 0xdeadbeef;
+  scratch.writeU32(SENTINEL);
+  const exact = rpc.exports.scanStart('uint32', { value: SENTINEL, regions: region });
+  const hits = rpc.exports.scanResults(exact.scanId, 0, 32).results;
+  const found = hits.some((hit) => ptr(hit.address).equals(scratch));
+  check(
+    'exact scan finds the sentinel',
+    found,
+    'candidates=' + exact.candidates + ' found=' + found
+  );
+  rpc.exports.scanStop(exact.scanId);
+
+  // Snapshot, mutate one slot, then narrow by 'changed'. Exactly one candidate
+  // should survive - the slot we touched.
+  const snapshot = rpc.exports.scanStart('uint32', { regions: region });
+  scratch.writeU32(0x0badf00d);
+  const refined = rpc.exports.scanRefine(snapshot.scanId, 'changed');
+  check(
+    'snapshot + changed refine narrows to one slot',
+    refined.candidates === 1,
+    'candidates=' + refined.candidates
+  );
+  rpc.exports.scanStop(snapshot.scanId);
+
+  // Hook a live export and drive it ourselves, so the result does not depend on
+  // how often the game happens to call it.
+  try {
+    const moduleName = 'kernel32.dll';
+    const symbol = 'GetTickCount';
+    const target = resolveExport(moduleName, symbol);
+    const trace = rpc.exports.hookExport(moduleName, symbol, 'uint(void)', { maxEvents: 16 });
+    const call = new NativeFunction(target, 'uint', []);
+    for (let i = 0; i < 3; i++) {
+      call();
+    }
+    const stopped = rpc.exports.traceStop(trace.traceId);
+    check('Interceptor hook fires', stopped.calls >= 3, 'calls=' + stopped.calls);
+  } catch (error) {
+    check('Interceptor hook fires', false, String(error));
+  }
+
+  return {
+    ok: checks.every((entry) => entry.ok),
+    arch: Process.arch,
+    pointerSize: Process.pointerSize,
+    checks,
+  };
 };
 
 /* ------------------------------------------------------------------ ready */
