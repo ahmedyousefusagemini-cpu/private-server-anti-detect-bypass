@@ -276,6 +276,13 @@ All of these are callable as `rpc.<name>(...)`.
 | `scanStop(scanId)` | release a scan |
 | `findPointersTo(target, options?)` | pointer-sized matches for `target` |
 | `hookExport(module, symbol, signature, options?)` | Interceptor hook, records calls |
+| `hookAddress(address, signature, options?)` | hook a raw address (Ghidra-found function) |
+| `symbolize(address)` | address -> module, module offset, nearest symbol |
+| `disassemble(address, count?)` | decode instructions with bytes |
+| `registers(threadId)` | CPU context of a thread |
+| `backtrace(threadId, limit?)` | symbolized call stack |
+| `callNative(address, retType, argTypes, args)` | invoke a function inside the target |
+| `protect(address, size, protection)` | change page protection |
 | `traceEvents(traceId, offset?, limit?)` | page recorded calls |
 | `traceStop(traceId)` | detach and return all events |
 | `selfTest()` | run the stage-5 checks in-process and return pass/fail |
@@ -285,7 +292,52 @@ call returns.
 
 ---
 
-## 6. Troubleshooting
+## 6. Ghidra and Frida together
+
+Ghidra does the static half; Frida does everything dynamic. The two meet at an
+address.
+
+**The Ghidra side** is already set up: project `PrivateClientServer`, program
+`Conquer.exe`, `x86:LE:32:default`, image base **`0x00400000`**, 208,956
+functions analysed. The MCP bridge is connected to it, so the analysis tools are
+live.
+
+**The address handoff.** `Conquer.exe` is a non-relocated executable at a fixed
+base, so an address means the same thing in both tools:
+
+```
+Frida  0x41f43a          -> module Conquer.exe, moduleOffset 0x1f43a
+Ghidra 0x0041f43a        -> the same instruction
+```
+
+`rpc.symbolize(addr)` gives you the module and the module-relative offset; add
+the module base and you have the Ghidra address. Because the base is
+`0x400000`, for `Conquer.exe` the two are literally the same number.
+
+**The loop:**
+
+1. Find the function in Ghidra (decompile, follow xrefs, read the callers).
+2. Note its address — e.g. `0x0041f43a`.
+3. Hook it in Frida by address, since internal functions have no export:
+
+```python
+t = rpc.hookAddress("0x41f43a", "int(int, pointer)", {"captureContext": True, "captureBacktrace": True})
+# ... exercise the game ...
+rpc.traceStop(t["traceId"])
+```
+
+4. `captureContext` records the registers at each hit and `captureBacktrace`
+   records the call stack — which is what tells you *who* called it and *with
+   what*, the thing a native debugger would have shown you.
+
+**Verifying a hook target before trusting it:** `rpc.disassemble(addr, 8)` shows
+the real instructions at that address, so you can confirm you are at a function
+prologue and not mid-instruction. `rpc.callNative(addr, retType, argTypes, args)`
+lets you call a game function directly and see what it returns.
+
+---
+
+## 7. Troubleshooting
 
 **`unable to connect to remote frida-server`.** Nothing is listening on the
 port, so the failure is upstream of the client. Run `python scripts/preflight.py`

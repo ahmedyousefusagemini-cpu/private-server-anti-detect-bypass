@@ -621,20 +621,24 @@ function formatValue(type, raw) {
   }
 }
 
-rpc.exports.hookExport = function (moduleName, symbol, signature, options) {
-  options = options || {};
-  const address = resolveExport(moduleName || null, symbol);
+// Shared by hookExport and hookAddress. Both install the same Interceptor hook;
+// they differ only in how the address was obtained.
+function installTrace(label, moduleName, address, signature, options) {
   const { retType, argTypes } = parseSignature(signature);
 
   const traceId = nextTraceId++;
   const maxEvents = options.maxEvents || DEFAULT_MAX_EVENTS;
+  const captureContext = options.captureContext === true;
+  const captureBacktrace = options.captureBacktrace === true;
 
   const trace = {
     id: traceId,
     target: address.toString(),
+    label,
     module: moduleName || null,
-    symbol,
     signature,
+    captureContext,
+    captureBacktrace,
     events: [],
     truncated: false,
     finished: false,
@@ -655,21 +659,30 @@ rpc.exports.hookExport = function (moduleName, symbol, signature, options) {
   trace.hook = Interceptor.attach(address, {
     onEnter(args) {
       const formatted = argTypes.map((type, index) => formatValue(type, args[index]));
-      pending.set(this.threadId, {
+      const entry = {
         at: Date.now(),
         threadId: this.threadId,
         args: formatted,
-      });
+      };
+      // Registers and a call stack at the moment of the call are what you would
+      // otherwise open a native debugger for. Both are opt-in because they cost
+      // real time on a hot function.
+      if (captureContext) {
+        entry.context = contextToObject(this.context);
+      }
+      if (captureBacktrace) {
+        entry.backtrace = Thread.backtrace(this.context, Backtracer.ACCURATE).map(describeAddress);
+      }
+      pending.set(this.threadId, entry);
     },
     onLeave(retval) {
       const entry = pending.get(this.threadId) || { at: Date.now(), threadId: this.threadId, args: [] };
       pending.delete(this.threadId);
-      record({
-        at: entry.at,
-        threadId: entry.threadId,
-        args: entry.args,
-        retval: retType === 'void' ? null : formatValue(retType, retval),
-      });
+      // Carry over whatever onEnter captured (context, backtrace) rather than
+      // rebuilding a fresh object and silently dropping it.
+      const event = Object.assign({}, entry);
+      event.retval = retType === 'void' ? null : formatValue(retType, retval);
+      record(event);
     },
   });
 
@@ -682,7 +695,44 @@ rpc.exports.hookExport = function (moduleName, symbol, signature, options) {
 
   traces.set(traceId, trace);
 
-  return { traceId, target: address.toString(), retType, argTypes, durationMs, maxEvents };
+  return {
+    traceId,
+    target: address.toString(),
+    label,
+    module: moduleName || null,
+    retType,
+    argTypes,
+    durationMs,
+    maxEvents,
+    captureContext,
+    captureBacktrace,
+  };
+}
+
+// Hook an exported symbol, by module + name.
+rpc.exports.hookExport = function (moduleName, symbol, signature, options) {
+  return installTrace(
+    (moduleName ? moduleName + '!' : '') + symbol,
+    moduleName || null,
+    resolveExport(moduleName || null, symbol),
+    signature,
+    options || {}
+  );
+};
+
+// Hook a raw address. This is the Ghidra path: static analysis gives you the
+// address of an internal function that has no export to look up, and you hook
+// that address directly.
+rpc.exports.hookAddress = function (address, signature, options) {
+  const target = ptr(address);
+  const module = Process.findModuleByAddress(target);
+  return installTrace(
+    target.toString(),
+    module ? module.name : null,
+    target,
+    signature,
+    options || {}
+  );
 };
 
 function stopTrace(traceId) {
@@ -785,21 +835,49 @@ rpc.exports.selfTest = function () {
   );
   rpc.exports.scanStop(snapshot.scanId);
 
-  // Hook a live export and drive it ourselves, so the result does not depend on
-  // how often the game happens to call it.
+  // Debugger primitives: symbolize an address, disassemble it, call a function,
+  // and capture registers + a call stack at a hook hit.
   try {
     const moduleName = 'kernel32.dll';
     const symbol = 'GetTickCount';
     const target = resolveExport(moduleName, symbol);
-    const trace = rpc.exports.hookExport(moduleName, symbol, 'uint(void)', { maxEvents: 16 });
-    const call = new NativeFunction(target, 'uint', []);
-    for (let i = 0; i < 3; i++) {
-      call();
-    }
+
+    const described = rpc.exports.symbolize(target);
+    check(
+      'symbolize resolves module + offset',
+      described.module === 'KERNEL32.DLL',
+      described.module + ' ' + described.moduleOffset
+    );
+
+    const disassembly = rpc.exports.disassemble(target, 4);
+    check(
+      'disassemble decodes instructions',
+      disassembly.count === 4,
+      disassembly.instructions.length ? disassembly.instructions[0].text : 'no instructions'
+    );
+
+    const trace = rpc.exports.hookExport(moduleName, symbol, 'uint(void)', {
+      maxEvents: 8,
+      captureContext: true,
+      captureBacktrace: true,
+    });
+    rpc.exports.callNative(target, 'uint', [], []);
     const stopped = rpc.exports.traceStop(trace.traceId);
-    check('Interceptor hook fires', stopped.calls >= 3, 'calls=' + stopped.calls);
+    check('Interceptor hook fires', stopped.calls >= 1, 'calls=' + stopped.calls);
+
+    const first = stopped.events[0] || {};
+    check(
+      'hook captured registers',
+      !!(first.context && first.context.eip),
+      'eip=' + (first.context ? first.context.eip : 'none')
+    );
+    check(
+      'hook captured a call stack',
+      (first.backtrace || []).length > 0,
+      'frames=' + (first.backtrace || []).length
+    );
   } catch (error) {
-    check('Interceptor hook fires', false, String(error));
+    check('debugger primitives', false, String(error));
   }
 
   return {
@@ -808,6 +886,144 @@ rpc.exports.selfTest = function () {
     pointerSize: Process.pointerSize,
     checks,
   };
+};
+
+/* --------------------------------------------------------- debugger surface */
+
+// These are the things you would otherwise open a native debugger for. They sit
+// alongside the hook/scan primitives so Frida alone covers the dynamic side.
+
+function contextToObject(context) {
+  const out = {};
+  const keys = [
+    'pc', 'sp',
+    'eip', 'esp', 'ebp', 'eflags',
+    'eax', 'ebx', 'ecx', 'edx', 'esi', 'edi',
+    'rip', 'rsp', 'rbp', 'rflags',
+    'rax', 'rbx', 'rcx', 'rdx', 'rsi', 'rdi',
+    'r8', 'r9', 'r10', 'r11', 'r12', 'r13', 'r14', 'r15',
+  ];
+  for (const key of keys) {
+    const value = context[key];
+    if (value === undefined || value === null) {
+      continue;
+    }
+    out[key] = typeof value === 'number' ? value : value.toString();
+  }
+  return out;
+}
+
+// Turn a raw address into something you can act on: which module it is in, how
+// far into it, and the nearest exported symbol. The module-relative offset is
+// what you carry into Ghidra (image base 0x400000 for this target).
+function describeAddress(address) {
+  const described = { address: address.toString() };
+
+  const module = Process.findModuleByAddress(address);
+  if (module) {
+    described.module = module.name;
+    described.moduleOffset = '0x' + address.sub(module.base).toString(16);
+  }
+
+  const symbol = DebugSymbol.fromAddress(address);
+  if (symbol && symbol.name) {
+    described.symbol = symbol.name;
+    described.offset = '0x' + address.sub(symbol.address).toString(16);
+    if (symbol.fileName) {
+      described.file = symbol.fileName;
+    }
+    if (symbol.lineNumber !== undefined) {
+      described.line = symbol.lineNumber;
+    }
+  }
+
+  return described;
+}
+
+rpc.exports.symbolize = function (address) {
+  return describeAddress(ptr(address));
+};
+
+rpc.exports.disassemble = function (address, count) {
+  const instructions = [];
+  const max = Math.min(count || 16, 512);
+  let cursor = ptr(address);
+
+  for (let index = 0; index < max; index++) {
+    const instruction = Instruction.parse(cursor);
+    instructions.push({
+      address: instruction.address.toString(),
+      bytes: hexOf(instruction.address.readByteArray(instruction.size)),
+      text: instruction.toString(),
+      mnemonic: instruction.mnemonic,
+      operands: instruction.opStr,
+    });
+    cursor = instruction.next;
+  }
+
+  return { address: ptr(address).toString(), count: instructions.length, instructions };
+};
+
+rpc.exports.registers = function (threadId) {
+  if (threadId === undefined || threadId === null) {
+    throw new Error('pass a thread id from threads()');
+  }
+  const thread = Process.enumerateThreads().find((entry) => entry.id === threadId);
+  if (!thread) {
+    throw new Error('no such thread: ' + threadId);
+  }
+  return { threadId, state: thread.state, context: contextToObject(thread.context) };
+};
+
+rpc.exports.backtrace = function (threadId, limit) {
+  if (threadId === undefined || threadId === null) {
+    throw new Error('pass a thread id from threads()');
+  }
+  const thread = Process.enumerateThreads().find((entry) => entry.id === threadId);
+  if (!thread) {
+    throw new Error('no such thread: ' + threadId);
+  }
+  const max = Math.min(limit || 32, 128);
+  return {
+    threadId,
+    frames: Thread.backtrace(thread.context, Backtracer.ACCURATE).slice(0, max).map(describeAddress),
+  };
+};
+
+// Invoke a function inside the target. Pointers may be passed as '0x...'
+// strings; everything else is passed through as a number.
+rpc.exports.callNative = function (address, retType, argTypes, args) {
+  if (!NATIVE_TYPES[retType]) {
+    throw new Error('unsupported return type: ' + retType);
+  }
+
+  const types = (argTypes || []).map((type) => {
+    if (!NATIVE_TYPES[type]) {
+      throw new Error('unsupported argument type: ' + type);
+    }
+    return NATIVE_TYPES[type];
+  });
+
+  const values = (args || []).map((value, index) => {
+    if (types[index] === 'pointer' && typeof value === 'string') {
+      return ptr(value);
+    }
+    return value;
+  });
+
+  const call = new NativeFunction(ptr(address), NATIVE_TYPES[retType], types);
+  const result = call.apply(null, values);
+
+  return {
+    address: ptr(address).toString(),
+    signature: retType + '(' + (argTypes || []).join(', ') + ')',
+    result: result === undefined ? null : String(result),
+  };
+};
+
+rpc.exports.protect = function (address, size, protection) {
+  const changed = Memory.protect(ptr(address), size, protection);
+  return { address: ptr(address).toString(), size, protection, changed };
 };
 
 /* ------------------------------------------------------------------ ready */
