@@ -26,7 +26,6 @@
 
 #include "gadget_loader.h"
 
-#include <cstdio>
 #include <string>
 
 namespace {
@@ -42,9 +41,13 @@ const wchar_t* const kGadgetEnvVar = L"DX9HOOK_GADGET";
 // A forwarder-only build of this DLL looks perfectly healthy - it loads, the
 // game runs, every D3DX call works - and simply never starts Frida. build.bat
 // greps the linked image for this string and fails loudly if it is absent, so
-// a stale source tree can never ship silently again. Referenced below so the
-// optimiser cannot discard it.
-const char kLoaderMarker[] = "DX9HOOK_GADGET_LOADER_V1";
+// a stale source tree can never ship silently again.
+//
+// A macro rather than a variable: adjacent string-literal concatenation only
+// joins literals, and this has to sit inside the debug string literal below so
+// the text lands in .rdata where findstr can see it. If you change the marker,
+// change it in build.bat and scripts/preflight.py too.
+#define DX9HOOK_LOADER_MARKER "DX9HOOK_GADGET_LOADER_V1"
 
 void Trace(const wchar_t* message)
 {
@@ -75,8 +78,8 @@ std::wstring ModuleDirectory(HMODULE module)
 std::wstring EnvironmentOverride()
 {
 	wchar_t buffer[32768] = {};
-	const DWORD length = GetEnvironmentVariableW(kGadgetEnvVar, buffer, 32768);
-	if (length == 0 || length >= 32768)
+	const DWORD length = GetEnvironmentVariableW(kGadgetEnvVar, buffer, 32768u);
+	if (length == 0 || length >= 32768u)
 	{
 		return std::wstring();
 	}
@@ -87,9 +90,9 @@ DWORD WINAPI LoaderThread(LPVOID parameter)
 {
 	const HMODULE proxyModule = static_cast<HMODULE>(parameter);
 
-	// Emits kLoaderMarker as a side effect: this call is what keeps the marker
-	// in the linked image for build.bat to find.
-	OutputDebugStringA("[dx9hook] gadget loader active: " kLoaderMarker "\n");
+	// The marker is part of this literal, so it lands in .rdata where build.bat
+	// can find it. It also makes DebugView say which build is running.
+	OutputDebugStringA("[dx9hook] gadget loader active: " DX9HOOK_LOADER_MARKER "\n");
 
 	std::wstring gadgetPath = EnvironmentOverride();
 	if (gadgetPath.empty())
@@ -130,12 +133,16 @@ DWORD WINAPI LoaderThread(LPVOID parameter)
 
 	if (gadgetModule == nullptr)
 	{
-		wchar_t message[512] = {};
-		_snwprintf_s(
-			message, _TRUNCATE,
-			L"[dx9hook] LoadLibraryEx failed for %s (error %lu)\n",
-			gadgetPath.c_str(), GetLastError());
-		Trace(message);
+		// Built with std::wstring rather than a wide printf: the _s printf
+		// family takes (buffer, sizeOfBuffer, count, format, ...), so it is
+		// easy to bind the format string to `count` by accident. Concatenation
+		// has no such trap and needs no fixed-size buffer.
+		std::wstring message = L"[dx9hook] LoadLibraryEx failed for ";
+		message += gadgetPath;
+		message += L" (error ";
+		message += std::to_wstring(GetLastError());
+		message += L")\n";
+		Trace(message.c_str());
 		return 1;
 	}
 
