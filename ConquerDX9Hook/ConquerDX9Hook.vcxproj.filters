@@ -14,9 +14,15 @@
     <ClInclude Include="version.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="src\gadget_loader.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\dllmain.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\gadget_loader.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="src\proxy.cpp">

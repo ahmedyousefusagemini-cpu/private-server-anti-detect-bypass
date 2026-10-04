@@ -111,6 +111,10 @@ _ReSharper*/
 Thumbs.db
 desktop.ini
 
+# Python
+__pycache__/
+*.pyc
+
 # Local editor plans
 .zcode/
 

@@ -99,9 +99,11 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="version.h" />
+    <ClInclude Include="src\gadget_loader.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\dllmain.cpp" />
+    <ClCompile Include="src\gadget_loader.cpp" />
     <ClCompile Include="src\proxy.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

@@ -5,9 +5,10 @@ loads *instead of* the real Direct3D 9 extension library, while every one of
 the real library's exports is forwarded straight through to the original. The
 proxy module is then free to run its own code inside the target process.
 
-This repo is deliberately scoped to the proxy mechanism only — the forwarding
-DLL and its entry point. There is no hooking, no overlay and no game logic
-here; those belong in a separate payload you add on top.
+This repo is deliberately scoped to the proxy mechanism and its payload hook.
+The forwarding DLL and its entry point are here, plus one payload wired into
+it: the **Frida Gadget**, loaded from a worker thread. See
+[USAGE.md](USAGE.md) for the full workflow.
 
 ## How it works
 
@@ -65,7 +66,43 @@ Deploy the built `D3DX9_43.dll` next to `Conquer.exe`, keeping the renamed
 `DllMain` runs under the loader lock, so keep it trivial — do not create
 windows, load modules or block on other threads from inside it. To add a
 payload, spawn a worker thread from `DLL_PROCESS_ATTACH` and do the real work
-there.
+there. `src/gadget_loader.cpp` does exactly this and is the worked example.
+
+## The Frida Gadget payload
+
+`DllMain` hands a worker thread the job of loading `D3DX9_43_44.dll` — the
+Frida Gadget — from beside the proxy. The Gadget then boots Frida inside the
+game process and listens on `127.0.0.1:27042`, so you can hook functions,
+scan memory for values, and patch them, all in-process and with no external
+injector.
+
+```
+python third_party/frida/fetch-gadget.py   # fetch + verify the Gadget into deploy/
+python scripts/attach.py                   # attach and drive the in-process agent
+```
+
+The sidecar is optional: with `D3DX9_43_44.dll` absent, the game runs exactly
+as before and no listener appears. Full instructions, worked examples and a
+troubleshooting table are in **[USAGE.md](USAGE.md)**.
+
+## Layout additions
+
+```
+scripts/
+  agent.js           in-process tooling (rpc.exports): scan, read/write, hook
+  attach.py          connect to the Gadget and drive the agent
+  preflight.py       check every link in the chain and name the broken one
+deploy/
+  D3DX9_43_44.config sidecar config for the Gadget
+third_party/frida/
+  fetch-gadget.py    download + verify the prebuilt 32-bit Gadget
+```
+
+`build.bat` asserts that the linked DLL contains the loader (it greps for the
+`DX9HOOK_GADGET_LOADER_V1` marker) and fails the build otherwise. A
+forwarder-only build of this DLL is completely healthy — it loads, the game
+runs, every D3DX call works — so a stale source tree would otherwise ship a
+proxy that silently never starts Frida.
 
 ## Requirements
 
